@@ -5,10 +5,15 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 
+// Cache simples em memória para evitar requisições repetidas e proteger a conta
+const cache = new Map();
+const CACHE_TTL = 30 * 60 * 1000; // 30 minutos
+
 app.get('/', (req, res) => {
-    res.json({ status: 'online', message: 'Proxy Instagram ativo' });
+    res.json({ status: 'online', message: 'API Proxy do Instagram ativa' });
 });
 
+// Rota 1: Busca os dados do último post de qualquer perfil público
 app.get('/api/latest-post', async (req, res) => {
     const { username } = req.query;
 
@@ -16,62 +21,87 @@ app.get('/api/latest-post', async (req, res) => {
         return res.status(400).json({ error: 'Username é obrigatório.' });
     }
 
+    const cleanUser = username.trim().toLowerCase().replace(/^@/, '');
+
+    // Verifica se já existe uma resposta recente no cache
+    const cached = cache.get(cleanUser);
+    if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
+        return res.json(cached.data);
+    }
+
+    const sessionId = process.env.IG_SESSION_ID;
+    if (!sessionId) {
+        return res.status(500).json({ error: 'Variável IG_SESSION_ID não configurada na Render.' });
+    }
+
     try {
-        // Acessa a versão de embed do perfil (menos bloqueada pela Meta)
-        const embedUrl = `https://www.instagram.com/${encodeURIComponent(username)}/embed/`;
+        const url = `https://i.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(cleanUser)}`;
         
-        const response = await axios.get(embedUrl, {
+        const response = await axios.get(url, {
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5'
+                'x-ig-app-id': '936619743392459',
+                'Cookie': `sessionid=${sessionId};`,
+                'Accept': '*/*',
+                'Referer': `https://www.instagram.com/${cleanUser}/`
             },
             timeout: 8000
         });
 
-        const html = response.data;
+        const user = response.data?.data?.user;
+        const edges = user?.edge_owner_to_timeline_media?.edges;
 
-        // O Instagram embute os dados do perfil dentro de um objeto JSON no script da página
-        const match = html.match(/"edge_owner_to_timeline_media":\{"count":\d+,"page_info":\{.*?\},"edges":(\[.*?\])\}/);
+        if (!edges || edges.length === 0) {
+            return res.status(404).json({ error: 'Nenhuma postagem encontrada ou perfil privado.' });
+        }
+
+        const latestPost = edges[0].node;
+        const caption = latestPost.edge_media_to_caption?.edges[0]?.node?.text || '';
         
-        if (match && match[1]) {
-            const edges = JSON.parse(match[1]);
-            if (edges.length > 0) {
-                const latestNode = edges[0].node;
-                const caption = latestNode.edge_media_to_caption?.edges[0]?.node?.text || '';
+        // Gera a URL passando pelo nosso proxy de imagem para evitar bloqueio de CORS no Tumblr
+        const hostUrl = `${req.protocol}://${req.get('host')}`;
+        const proxiedImageUrl = `${hostUrl}/api/image-proxy?url=${encodeURIComponent(latestPost.display_url)}`;
 
-                return res.json({
-                    username: username,
-                    media_url: latestNode.display_url,
-                    caption: caption,
-                    permalink: `https://www.instagram.com/p/${latestNode.shortcode}/`
-                });
-            }
-        }
+        const resultData = {
+            username: cleanUser,
+            media_url: proxiedImageUrl,
+            original_media_url: latestPost.display_url,
+            caption: caption,
+            permalink: `https://www.instagram.com/p/${latestPost.shortcode}/`
+        };
 
-        // Fallback: tenta capturar a primeira imagem de postagem direto do HTML do embed
-        const imgMatch = html.match(/class="EmbeddedMediaImage"[^>]+src="([^"]+)"/);
-        const linkMatch = html.match(/href="(https:\/\/www\.instagram\.com\/p\/[^"\/]+\/)/);
+        // Salva no cache
+        cache.set(cleanUser, { timestamp: Date.now(), data: resultData });
 
-        if (imgMatch && imgMatch[1]) {
-            // Decodifica entidades HTML (&amp;) na URL da imagem
-            const cleanImgUrl = imgMatch[1].replace(/&amp;/g, '&');
-            return res.json({
-                username: username,
-                media_url: cleanImgUrl,
-                caption: `Última publicação de @${username}`,
-                permalink: linkMatch ? linkMatch[1] : `https://www.instagram.com/${username}/`
-            });
-        }
-
-        return res.status(404).json({ error: 'Não foi possível extrair o post (perfil privado ou estrutura alterada).' });
+        return res.json(resultData);
 
     } catch (error) {
-        console.error('Erro ao buscar embed:', error.message);
-        return res.status(503).json({ 
-            error: 'Serviço temporariamente indisponível.',
-            fallback_url: `https://instagram.com/${username}`
+        console.error('Erro na API do Instagram:', error.response?.status, error.message);
+        return res.status(500).json({ 
+            error: 'Não foi possível carregar o post.',
+            status_code: error.response?.status || 500
         });
+    }
+});
+
+// Rota 2: Proxy de imagem para contornar o bloqueio Cross-Origin do Instagram nos navegadores
+app.get('/api/image-proxy', async (req, res) => {
+    const { url } = req.query;
+    if (!url) return res.status(400).send('URL obrigatória');
+
+    try {
+        const response = await axios.get(url, {
+            responseType: 'stream',
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+            }
+        });
+
+        res.setHeader('Content-Type', response.headers['content-type'] || 'image/jpeg');
+        res.setHeader('Cache-Control', 'public, max-age=86400'); // Cache no navegador por 24h
+        response.data.pipe(res);
+    } catch (err) {
+        res.status(500).send('Erro ao carregar imagem');
     }
 });
 

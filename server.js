@@ -5,15 +5,14 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 
-// Cache simples em memória para evitar requisições repetidas e proteger a conta
+// Cache em memória de 60 minutos para economizar seus créditos gratuitos do ScraperAPI
 const cache = new Map();
-const CACHE_TTL = 30 * 60 * 1000; // 30 minutos
+const CACHE_TTL = 60 * 60 * 1000; 
 
 app.get('/', (req, res) => {
-    res.json({ status: 'online', message: 'API Proxy do Instagram ativa' });
+    res.json({ status: 'online', message: 'Proxy Instagram via ScraperAPI ativo' });
 });
 
-// Rota 1: Busca os dados do último post de qualquer perfil público
 app.get('/api/latest-post', async (req, res) => {
     const { username } = req.query;
 
@@ -23,29 +22,30 @@ app.get('/api/latest-post', async (req, res) => {
 
     const cleanUser = username.trim().toLowerCase().replace(/^@/, '');
 
-    // Verifica se já existe uma resposta recente no cache
+    // 1. Verifica se já está salvo no cache antes de gastar crédito da API
     const cached = cache.get(cleanUser);
     if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
         return res.json(cached.data);
     }
 
-    const sessionId = process.env.IG_SESSION_ID;
-    if (!sessionId) {
-        return res.status(500).json({ error: 'Variável IG_SESSION_ID não configurada na Render.' });
+    const apiKey = process.env.SCRAPER_API_KEY;
+    if (!apiKey) {
+        return res.status(500).json({ error: 'Variável SCRAPER_API_KEY não configurada na Render.' });
     }
 
     try {
-        const url = `https://i.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(cleanUser)}`;
+        // Endpoint interno do perfil público
+        const targetUrl = `https://i.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(cleanUser)}`;
         
-        const response = await axios.get(url, {
+        // Roteia a requisição através do ScraperAPI para mascarar o IP
+        const proxyUrl = `http://api.scraperapi.com?api_key=${apiKey}&url=${encodeURIComponent(targetUrl)}`;
+
+        const response = await axios.get(proxyUrl, {
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
                 'x-ig-app-id': '936619743392459',
-                'Cookie': `sessionid=${sessionId};`,
-                'Accept': '*/*',
-                'Referer': `https://www.instagram.com/${cleanUser}/`
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
             },
-            timeout: 8000
+            timeout: 25000 // Proxies residenciais podem levar alguns segundos extras
         });
 
         const user = response.data?.data?.user;
@@ -57,15 +57,14 @@ app.get('/api/latest-post', async (req, res) => {
 
         const latestPost = edges[0].node;
         const caption = latestPost.edge_media_to_caption?.edges[0]?.node?.text || '';
-        
-        // Gera a URL passando pelo nosso proxy de imagem para evitar bloqueio de CORS no Tumblr
-        const hostUrl = `${req.protocol}://${req.get('host')}`;
+
+        // Usa a rota local de imagem para evitar bloqueio de CORS no navegador
+        const hostUrl = `https://${req.get('host')}`;
         const proxiedImageUrl = `${hostUrl}/api/image-proxy?url=${encodeURIComponent(latestPost.display_url)}`;
 
         const resultData = {
             username: cleanUser,
             media_url: proxiedImageUrl,
-            original_media_url: latestPost.display_url,
             caption: caption,
             permalink: `https://www.instagram.com/p/${latestPost.shortcode}/`
         };
@@ -76,7 +75,7 @@ app.get('/api/latest-post', async (req, res) => {
         return res.json(resultData);
 
     } catch (error) {
-        console.error('Erro na API do Instagram:', error.response?.status, error.message);
+        console.error('Erro via ScraperAPI:', error.response?.status, error.message);
         return res.status(500).json({ 
             error: 'Não foi possível carregar o post.',
             status_code: error.response?.status || 500
@@ -84,7 +83,7 @@ app.get('/api/latest-post', async (req, res) => {
     }
 });
 
-// Rota 2: Proxy de imagem para contornar o bloqueio Cross-Origin do Instagram nos navegadores
+// Rota proxy para carregar a imagem sem bloqueios no Tumblr
 app.get('/api/image-proxy', async (req, res) => {
     const { url } = req.query;
     if (!url) return res.status(400).send('URL obrigatória');
@@ -98,7 +97,7 @@ app.get('/api/image-proxy', async (req, res) => {
         });
 
         res.setHeader('Content-Type', response.headers['content-type'] || 'image/jpeg');
-        res.setHeader('Cache-Control', 'public, max-age=86400'); // Cache no navegador por 24h
+        res.setHeader('Cache-Control', 'public, max-age=86400');
         response.data.pipe(res);
     } catch (err) {
         res.status(500).send('Erro ao carregar imagem');

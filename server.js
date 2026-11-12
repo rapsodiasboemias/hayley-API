@@ -320,3 +320,250 @@ app.get('/api/image-proxy', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
+
+const TIKTOK_RAPIDAPI_HOST = 'tiktok-scraper7.p.rapidapi.com';
+const THREADS_RAPIDAPI_HOST = 'threads-api4.p.rapidapi.com';
+
+const youtubeCache = new Map();
+const youtubeIdCache = new Map();
+const tiktokCache = new Map();
+const threadsCache = new Map();
+
+// ==========================================
+// FUNÇÕES AUXILIARES NOVAS
+// ==========================================
+
+async function resolveYoutubeChannelId(input) {
+    const clean = input.trim();
+    if (/^UC[\w-]{22}$/.test(clean)) return clean;
+
+    const cachedId = youtubeIdCache.get(clean.toLowerCase());
+    if (cachedId) return cachedId;
+
+    const handle = clean.startsWith('@') ? clean : `@${clean}`;
+    const res = await axios.get(`https://www.youtube.com/${encodeURI(handle)}`, {
+        headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9'
+        },
+        timeout: 15000
+    });
+
+    const match = res.data.match(/"externalId":"(UC[\w-]{22})"/);
+    if (match && match[1]) {
+        youtubeIdCache.set(clean.toLowerCase(), match[1]);
+        return match[1];
+    }
+    return null;
+}
+
+function decodeXmlEntities(str) {
+    if (!str) return '';
+    return str
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'");
+}
+
+// ==========================================
+// ROTA YOUTUBE (/api/latest-youtube) - 100% GRATUITA VIA RSS OFICIAL
+// ==========================================
+
+app.get('/api/latest-youtube', async (req, res) => {
+    const { channel } = req.query;
+    if (!channel) {
+        return res.status(400).json({ error: 'Parâmetro channel (ID UC... ou @handle) é obrigatório.' });
+    }
+
+    const cacheKey = channel.trim().toLowerCase();
+    const cached = youtubeCache.get(cacheKey);
+    if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
+        return res.json(cached.data);
+    }
+
+    try {
+        const channelId = await resolveYoutubeChannelId(channel);
+        if (!channelId) {
+            return res.status(404).json({ error: 'Canal do YouTube não encontrado.' });
+        }
+
+        const feedUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
+        const feedRes = await axios.get(feedUrl, { timeout: 15000 });
+        const xml = feedRes.data;
+
+        const authorMatch = xml.match(/<author>\s*<name>([\s\S]*?)<\/name>/);
+        const entryMatch = xml.match(/<entry>([\s\S]*?)<\/entry>/);
+
+        if (!entryMatch) {
+            return res.status(404).json({ error: 'Nenhum vídeo encontrado neste canal.' });
+        }
+
+        const entry = entryMatch[1];
+        const videoIdMatch = entry.match(/<yt:videoId>([\s\S]*?)<\/yt:videoId>/);
+        const titleMatch = entry.match(/<title>([\s\S]*?)<\/title>/);
+        const publishedMatch = entry.match(/<published>([\s\S]*?)<\/published>/);
+
+        if (!videoIdMatch) {
+            return res.status(404).json({ error: 'Não foi possível extrair o ID do vídeo.' });
+        }
+
+        const videoId = videoIdMatch[1].trim();
+        const hostUrl = `https://${req.get('host')}`;
+        const rawThumb = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+
+        const resultData = {
+            channel_id: channelId,
+            channel_name: authorMatch ? decodeXmlEntities(authorMatch[1].trim()) : channel,
+            video_id: videoId,
+            title: titleMatch ? decodeXmlEntities(titleMatch[1].trim()) : 'Último vídeo',
+            thumbnail_url: `${hostUrl}/api/image-proxy?url=${encodeURIComponent(rawThumb)}`,
+            published_at: publishedMatch ? publishedMatch[1].trim() : null,
+            permalink: `https://www.youtube.com/watch?v=${videoId}`
+        };
+
+        youtubeCache.set(cacheKey, { timestamp: Date.now(), data: resultData });
+        return res.json(resultData);
+
+    } catch (error) {
+        console.error(`Erro YouTube (${channel}):`, error.message);
+        return res.status(500).json({ error: 'Falha ao carregar feed do YouTube.' });
+    }
+});
+
+// ==========================================
+// ROTA TIKTOK (/api/latest-tiktok) - VIA RAPIDAPI (tiktok-scraper7)
+// ==========================================
+
+app.get('/api/latest-tiktok', async (req, res) => {
+    const { username } = req.query;
+    if (!username) {
+        return res.status(400).json({ error: 'Username é obrigatório.' });
+    }
+
+    const cleanUser = username.trim().toLowerCase().replace(/^@/, '');
+    const cached = tiktokCache.get(cleanUser);
+    if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
+        return res.json(cached.data);
+    }
+
+    const apiKey = process.env.RAPIDAPI_KEY;
+    if (!apiKey) {
+        return res.status(500).json({ error: 'Variável RAPIDAPI_KEY não configurada.' });
+    }
+
+    try {
+        const response = await axios.get(`https://${TIKTOK_RAPIDAPI_HOST}/user/posts`, {
+            params: {
+                unique_id: cleanUser,
+                count: 5
+            },
+            headers: {
+                'x-rapidapi-key': apiKey,
+                'x-rapidapi-host': TIKTOK_RAPIDAPI_HOST
+            },
+            timeout: 25000
+        });
+
+        const videos = response.data?.data?.videos || [];
+        if (!Array.isArray(videos) || videos.length === 0) {
+            return res.status(404).json({ error: 'Nenhum TikTok público encontrado.' });
+        }
+
+        // Prioriza vídeo não fixado se houver
+        let selected = videos.find(v => !v.is_top) || videos[0];
+        const rawCover = selected.cover || selected.origin_cover || selected.ai_dynamic_cover || null;
+        const videoId = selected.video_id || selected.id;
+        const hostUrl = `https://${req.get('host')}`;
+
+        const resultData = {
+            username: selected.author?.unique_id || cleanUser,
+            nickname: selected.author?.nickname || cleanUser,
+            caption: (selected.title || `Último TikTok de @${cleanUser}`).trim(),
+            cover_url: rawCover ? `${hostUrl}/api/image-proxy?url=${encodeURIComponent(rawCover)}` : null,
+            play_count: selected.play_count || 0,
+            permalink: videoId
+                ? `https://www.tiktok.com/@${cleanUser}/video/${videoId}`
+                : `https://www.tiktok.com/@${cleanUser}`
+        };
+
+        tiktokCache.set(cleanUser, { timestamp: Date.now(), data: resultData });
+        return res.json(resultData);
+
+    } catch (error) {
+        console.error(`Erro TikTok @${cleanUser}:`, error.response?.status, error.message);
+        return res.status(500).json({ error: 'Não foi possível carregar o último TikTok.' });
+    }
+});
+
+// ==========================================
+// ROTA THREADS (/api/latest-threads) - VIA RAPIDAPI (threads-api4)
+// ==========================================
+
+app.get('/api/latest-threads', async (req, res) => {
+    const { username } = req.query;
+    if (!username) {
+        return res.status(400).json({ error: 'Username é obrigatório.' });
+    }
+
+    const cleanUser = username.trim().toLowerCase().replace(/^@/, '');
+    const cached = threadsCache.get(cleanUser);
+    if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
+        return res.json(cached.data);
+    }
+
+    const apiKey = process.env.RAPIDAPI_KEY;
+    if (!apiKey) {
+        return res.status(500).json({ error: 'Variável RAPIDAPI_KEY não configurada.' });
+    }
+
+    try {
+        const response = await axios.get(`https://${THREADS_RAPIDAPI_HOST}/api/user/posts`, {
+            params: { username: cleanUser },
+            headers: {
+                'x-rapidapi-key': apiKey,
+                'x-rapidapi-host': THREADS_RAPIDAPI_HOST
+            },
+            timeout: 25000
+        });
+
+        // Estrutura padrão de resposta do threads-api4
+        const threadsList = response.data?.data?.mediaData?.threads || response.data?.threads || [];
+        if (!Array.isArray(threadsList) || threadsList.length === 0) {
+            return res.status(404).json({ error: 'Nenhuma publicação encontrada no Threads.' });
+        }
+
+        // Pega o primeiro post do thread principal
+        const firstThread = threadsList[0];
+        const post = firstThread?.thread_items?.[0]?.post || firstThread;
+
+        const captionText = post?.caption?.text || '';
+        const postCode = post?.code;
+
+        let rawMedia = null;
+        if (Array.isArray(post?.carousel_media) && post.carousel_media.length > 0) {
+            rawMedia = post.carousel_media[0]?.image_versions2?.candidates?.[0]?.url || null;
+        } else if (post?.image_versions2?.candidates?.[0]?.url) {
+            rawMedia = post.image_versions2.candidates[0].url;
+        }
+
+        const hostUrl = `https://${req.get('host')}`;
+
+        const resultData = {
+            username: post?.user?.username || cleanUser,
+            text: captionText || `Nova atualização de @${cleanUser} no Threads`,
+            media_url: rawMedia ? `${hostUrl}/api/image-proxy?url=${encodeURIComponent(rawMedia)}` : null,
+            permalink: postCode
+                ? `https://www.threads.net/@${cleanUser}/post/${postCode}`
+                : `https://www.threads.net/@${cleanUser}`
+        };
+
+        threadsCache.set(cleanUser, { timestamp: Date.now(), data: resultData });
+        return res.json(resultData);
+
+    } catch (error) {
+        console.error(`Erro Threads @${cleanUser}:`, error.response?.status, error.message);
+        return res.status(500).json({ error: 'Não foi possível carregar o último post do Threads.' });
+    }
+});

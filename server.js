@@ -389,7 +389,7 @@ app.get('/api/latest-youtube', async (req, res) => {
 
         const videoId = videoIdMatch[1].trim();
         const hostUrl = `https://${req.get('host')}`;
-        const rawThumb = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+        const rawThumb = `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`;
 
         const resultData = {
             channel_id: channelId,
@@ -553,17 +553,22 @@ app.get('/api/image-proxy', async (req, res) => {
 
     try {
         const parsed = new URL(url);
-        const referer = parsed.hostname.includes('tiktok')
-            ? 'https://www.tiktok.com/'
-            : 'https://www.instagram.com/';
+        const reqHeaders = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
+        };
+
+        if (parsed.hostname.includes('tiktok')) {
+            reqHeaders['Referer'] = 'https://www.tiktok.com/';
+        } else if (parsed.hostname.includes('ytimg') || parsed.hostname.includes('youtube')) {
+            reqHeaders['Referer'] = 'https://www.youtube.com/';
+        } else {
+            reqHeaders['Referer'] = 'https://www.instagram.com/';
+        }
 
         const response = await axios.get(url, {
             responseType: 'stream',
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
-                'Referer': referer
-            },
+            headers: reqHeaders,
             timeout: 15000
         });
 
@@ -571,6 +576,7 @@ app.get('/api/image-proxy', async (req, res) => {
         res.setHeader('Cache-Control', 'public, max-age=86400');
         response.data.pipe(res);
     } catch (err) {
+        console.error('Erro no image-proxy:', url, err.message);
         res.status(500).send('Erro ao carregar imagem');
     }
 });

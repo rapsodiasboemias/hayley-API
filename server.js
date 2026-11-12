@@ -235,10 +235,7 @@ app.get('/api/latest-tweet', async (req, res) => {
     const apiKey = process.env.RAPIDAPI_KEY;
     const hostUrl = `https://${req.get('host')}`;
 
-    try {
-        let tweetData = null;
-
-        // 2. Busca via Twitter API45 (1 única requisição direto pelo screenname)
+    // 2. Busca via Twitter API45 (1 única requisição direto pelo screenname)
         if (apiKey) {
             try {
                 const timelineRes = await axios.get(`https://${TWITTER_RAPIDAPI_HOST}/timeline.php`, {
@@ -250,40 +247,50 @@ app.get('/api/latest-tweet', async (req, res) => {
                     timeout: 20000
                 });
 
-                const timeline = timelineRes.data?.timeline || [];
-                const userInfo = timelineRes.data?.user || {};
+                const rawData = timelineRes.data || {};
+                const timeline = Array.isArray(rawData.timeline) ? rawData.timeline : [];
+                const userInfo = rawData.user || {};
 
-                if (Array.isArray(timeline) && timeline.length > 0) {
+                // Se a timeline vier vazia, verifica se existe um tweet fixado (pinned)
+                if (timeline.length === 0 && rawData.pinned) {
+                    timeline.push(rawData.pinned);
+                }
+
+                if (timeline.length > 0) {
                     // Prioriza tweet original (ignora retweets e respostas diretas)
                     let selected = timeline.find(t => {
-                        const isRetweet = Boolean(t.retweeted_tweet) || t.text?.startsWith('RT @');
-                        const isReply = Boolean(t.in_reply_to_screen_name);
+                        if (!t || !t.text) return false;
+                        const isRetweet = Boolean(t.retweeted_tweet || t.retweeted) || t.text.startsWith('RT @');
+                        const isReply = Boolean(t.in_reply_to_screen_name || t.in_reply_to_status_id_str);
                         return !isRetweet && !isReply;
                     });
 
-                    // Fallback: se só houver retweets/respostas, pega o primeiro da lista
+                    // Fallback: se só houver retweets/respostas, pega o primeiro tweet válido
                     if (!selected) {
-                        selected = timeline[0];
+                        selected = timeline.find(t => t && (t.text || t.media));
                     }
 
-                    // Extrai foto ou thumbnail de vídeo, se houver
-                    const rawMedia = selected.media?.photo?.[0]?.media_url_https
-                                  || selected.media?.video?.[0]?.media_url_https
-                                  || null;
+                    if (selected) {
+                        // Extrai foto ou thumbnail de vídeo, se houver
+                        const rawMedia = selected.media?.photo?.[0]?.media_url_https
+                                      || selected.media?.video?.[0]?.media_url_https
+                                      || null;
 
-                    const cleanText = (selected.text || '').replace(/https:\/\/t\.co\/\w+$/g, '').trim();
-                    const tweetId = selected.tweet_id || selected.id_str;
+                        const cleanText = (selected.text || '').replace(/https:\/\/t\.co\/\w+$/g, '').trim();
+                        const tweetId = selected.tweet_id || selected.id_str;
+                        const officialHandle = userInfo.screen_name || selected.user_info?.screen_name || cleanUser;
 
-                    tweetData = {
-                        username: cleanUser,
-                        name: userInfo.name || selected.user_info?.name || cleanUser,
-                        text: cleanText,
-                        media_url: rawMedia,
-                        created_at: selected.created_at || null,
-                        permalink: tweetId
-                            ? `https://x.com/${cleanUser}/status/${tweetId}`
-                            : `https://x.com/${cleanUser}`
-                    };
+                        tweetData = {
+                            username: officialHandle,
+                            name: userInfo.name || selected.user_info?.name || officialHandle,
+                            text: cleanText,
+                            media_url: rawMedia,
+                            created_at: selected.created_at || null,
+                            permalink: tweetId
+                                ? `https://x.com/${officialHandle}/status/${tweetId}`
+                                : `https://x.com/${officialHandle}`
+                        };
+                    }
                 }
             } catch (rapidErr) {
                 console.warn(`Twitter API45 falhou para @${cleanUser}:`, rapidErr.response?.status, rapidErr.message);

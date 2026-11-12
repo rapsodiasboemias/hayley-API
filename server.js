@@ -7,17 +7,35 @@ app.use(cors());
 
 const IG_RAPIDAPI_HOST = 'instagram-looter2.p.rapidapi.com';
 const TWITTER_RAPIDAPI_HOST = 'twitter-api45.p.rapidapi.com';
+const TIKTOK_RAPIDAPI_HOST = 'tiktok-scraper7.p.rapidapi.com';
+const THREADS_RAPIDAPI_HOST = 'threads-api4.p.rapidapi.com';
 
 // Cache de 12 horas para economizar requisições na cota gratuita
 const postsCache = new Map();
 const userIdCache = new Map();
 const tweetsCache = new Map();
+const youtubeCache = new Map();
+const youtubeIdCache = new Map();
+const tiktokCache = new Map();
+const threadsCache = new Map();
 const CACHE_TTL = 12 * 60 * 60 * 1000;
+
+// Limpeza automática de cache expirado a cada 6 horas
+setInterval(() => {
+    const now = Date.now();
+    [postsCache, tweetsCache, youtubeCache, tiktokCache, threadsCache].forEach(cache => {
+        for (const [key, value] of cache.entries()) {
+            if (now - value.timestamp >= CACHE_TTL) {
+                cache.delete(key);
+            }
+        }
+    });
+}, 6 * 60 * 60 * 1000);
 
 app.get('/', (req, res) => {
     res.json({
         status: 'online',
-        message: 'API Proxy Instagram & Twitter/X (Source Blogs Ready) ativa'
+        message: 'API Proxy Source Blogs Ready (IG, X, YT, TikTok, Threads) ativa'
     });
 });
 
@@ -81,6 +99,40 @@ async function fetchTweetViaSyndication(cleanUser) {
         created_at: selected.created_at || null,
         permalink: `https://x.com/${cleanUser}/status/${selected.id_str}`
     };
+}
+
+async function resolveYoutubeChannelId(input) {
+    const clean = input.trim();
+    if (/^UC[\w-]{22}$/.test(clean)) return clean;
+
+    const cachedId = youtubeIdCache.get(clean.toLowerCase());
+    if (cachedId) return cachedId;
+
+    const handle = clean.startsWith('@') ? clean : `@${clean}`;
+    const res = await axios.get(`https://www.youtube.com/${encodeURI(handle)}`, {
+        headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9'
+        },
+        timeout: 15000
+    });
+
+    const match = res.data.match(/"externalId":"(UC[\w-]{22})"/);
+    if (match && match[1]) {
+        youtubeIdCache.set(clean.toLowerCase(), match[1]);
+        return match[1];
+    }
+    return null;
+}
+
+function decodeXmlEntities(str) {
+    if (!str) return '';
+    return str
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'");
 }
 
 // ==========================================
@@ -294,80 +346,6 @@ app.get('/api/latest-tweet', async (req, res) => {
 });
 
 // ==========================================
-// PROXY DE IMAGEM (/api/image-proxy)
-// ==========================================
-
-app.get('/api/image-proxy', async (req, res) => {
-    const { url } = req.query;
-    if (!url) return res.status(400).send('URL obrigatória');
-
-    try {
-        const response = await axios.get(url, {
-            responseType: 'stream',
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-            },
-            timeout: 15000
-        });
-
-        res.setHeader('Content-Type', response.headers['content-type'] || 'image/jpeg');
-        res.setHeader('Cache-Control', 'public, max-age=86400');
-        response.data.pipe(res);
-    } catch (err) {
-        res.status(500).send('Erro ao carregar imagem');
-    }
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
-
-const TIKTOK_RAPIDAPI_HOST = 'tiktok-scraper7.p.rapidapi.com';
-const THREADS_RAPIDAPI_HOST = 'threads-api4.p.rapidapi.com';
-
-const youtubeCache = new Map();
-const youtubeIdCache = new Map();
-const tiktokCache = new Map();
-const threadsCache = new Map();
-
-// ==========================================
-// FUNÇÕES AUXILIARES NOVAS
-// ==========================================
-
-async function resolveYoutubeChannelId(input) {
-    const clean = input.trim();
-    if (/^UC[\w-]{22}$/.test(clean)) return clean;
-
-    const cachedId = youtubeIdCache.get(clean.toLowerCase());
-    if (cachedId) return cachedId;
-
-    const handle = clean.startsWith('@') ? clean : `@${clean}`;
-    const res = await axios.get(`https://www.youtube.com/${encodeURI(handle)}`, {
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Accept-Language': 'en-US,en;q=0.9'
-        },
-        timeout: 15000
-    });
-
-    const match = res.data.match(/"externalId":"(UC[\w-]{22})"/);
-    if (match && match[1]) {
-        youtubeIdCache.set(clean.toLowerCase(), match[1]);
-        return match[1];
-    }
-    return null;
-}
-
-function decodeXmlEntities(str) {
-    if (!str) return '';
-    return str
-        .replace(/&amp;/g, '&')
-        .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>')
-        .replace(/&quot;/g, '"')
-        .replace(/&#39;/g, "'");
-}
-
-// ==========================================
 // ROTA YOUTUBE (/api/latest-youtube) - 100% GRATUITA VIA RSS OFICIAL
 // ==========================================
 
@@ -471,7 +449,6 @@ app.get('/api/latest-tiktok', async (req, res) => {
             return res.status(404).json({ error: 'Nenhum TikTok público encontrado.' });
         }
 
-        // Prioriza vídeo não fixado se houver
         let selected = videos.find(v => !v.is_top) || videos[0];
         const rawCover = selected.cover || selected.origin_cover || selected.ai_dynamic_cover || null;
         const videoId = selected.video_id || selected.id;
@@ -528,13 +505,11 @@ app.get('/api/latest-threads', async (req, res) => {
             timeout: 25000
         });
 
-        // Estrutura padrão de resposta do threads-api4
         const threadsList = response.data?.data?.mediaData?.threads || response.data?.threads || [];
         if (!Array.isArray(threadsList) || threadsList.length === 0) {
             return res.status(404).json({ error: 'Nenhuma publicação encontrada no Threads.' });
         }
 
-        // Pega o primeiro post do thread principal
         const firstThread = threadsList[0];
         const post = firstThread?.thread_items?.[0]?.post || firstThread;
 
@@ -567,3 +542,42 @@ app.get('/api/latest-threads', async (req, res) => {
         return res.status(500).json({ error: 'Não foi possível carregar o último post do Threads.' });
     }
 });
+
+// ==========================================
+// PROXY DE IMAGEM (/api/image-proxy)
+// ==========================================
+
+app.get('/api/image-proxy', async (req, res) => {
+    const { url } = req.query;
+    if (!url) return res.status(400).send('URL obrigatória');
+
+    try {
+        const parsed = new URL(url);
+        const referer = parsed.hostname.includes('tiktok')
+            ? 'https://www.tiktok.com/'
+            : 'https://www.instagram.com/';
+
+        const response = await axios.get(url, {
+            responseType: 'stream',
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+                'Referer': referer
+            },
+            timeout: 15000
+        });
+
+        res.setHeader('Content-Type', response.headers['content-type'] || 'image/jpeg');
+        res.setHeader('Cache-Control', 'public, max-age=86400');
+        response.data.pipe(res);
+    } catch (err) {
+        res.status(500).send('Erro ao carregar imagem');
+    }
+});
+
+// ==========================================
+// INICIALIZAÇÃO DO SERVIDOR
+// ==========================================
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));

@@ -18,18 +18,19 @@ const youtubeCache = new Map();
 const youtubeIdCache = new Map();
 const tiktokCache = new Map();
 const threadsCache = new Map();
-const CACHE_TTL = 12 * 60 * 60 * 1000;
-const IG_CACHE_TTL = 2 * 60 * 60 * 1000;
+const CACHE_TTL = 12 * 60 * 60 * 1000;       // 12h para YouTube e Twitter/X (URLs permanentes)
+const SHORT_CACHE_TTL = 2 * 60 * 60 * 1000;  // 2h para Instagram, Threads e TikTok (CDNs que expiram)
 
-// Limpeza automática de cache expirado a cada 6 horas
 setInterval(() => {
     const now = Date.now();
-    for (const [key, value] of postsCache.entries()) {
-        if (now - value.timestamp >= IG_CACHE_TTL) {
-            postsCache.delete(key);
+    [postsCache, tiktokCache, threadsCache].forEach(cache => {
+        for (const [key, value] of cache.entries()) {
+            if (now - value.timestamp >= SHORT_CACHE_TTL) {
+                cache.delete(key);
+            }
         }
-    }
-    [tweetsCache, youtubeCache, tiktokCache, threadsCache].forEach(cache => {
+    });
+    [tweetsCache, youtubeCache].forEach(cache => {
         for (const [key, value] of cache.entries()) {
             if (now - value.timestamp >= CACHE_TTL) {
                 cache.delete(key);
@@ -155,10 +156,7 @@ app.get('/api/latest-post', async (req, res) => {
     const cleanUser = username.trim().toLowerCase().replace(/^@/, '');
 
     const cachedPost = postsCache.get(cleanUser);
-    if (cachedPost && (Date.now() - cachedPost.timestamp < IG_CACHE_TTL)) {
-        return res.json(cachedPost.data);
-    }
-    
+    if (cachedPost && (Date.now() - cachedPost.timestamp < SHORT_CACHE_TTL)) {
     const apiKey = process.env.RAPIDAPI_KEY;
     if (!apiKey) {
         return res.status(500).json({ error: 'Variável RAPIDAPI_KEY não configurada na Render.' });
@@ -428,10 +426,7 @@ app.get('/api/latest-tiktok', async (req, res) => {
 
     const cleanUser = username.trim().toLowerCase().replace(/^@/, '');
     const cached = tiktokCache.get(cleanUser);
-    if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
-        return res.json(cached.data);
-    }
-
+    if (cached && (Date.now() - cached.timestamp < SHORT_CACHE_TTL)) {
     const apiKey = process.env.RAPIDAPI_KEY;
     if (!apiKey) {
         return res.status(500).json({ error: 'Variável RAPIDAPI_KEY não configurada.' });
@@ -589,10 +584,7 @@ app.get('/api/latest-threads', async (req, res) => {
 
     const cleanUser = username.trim().toLowerCase().replace(/^@/, '');
     const cached = threadsCache.get(cleanUser);
-    if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
-        return res.json(cached.data);
-    }
-
+    if (cached && (Date.now() - cached.timestamp < SHORT_CACHE_TTL)) {
     const apiKey = process.env.RAPIDAPI_KEY;
     if (!apiKey) {
         return res.status(500).json({ error: 'Variável RAPIDAPI_KEY não configurada.' });

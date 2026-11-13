@@ -722,26 +722,30 @@ async function resolveThreadsUserId(cleanUser, headers) {
         }
     }
 
-    // 2. Busca pelo endpoint Search da threads21
-    try {
-        const res = await axios.get(`https://${THREADS_RAPIDAPI_HOST}/api/search`, {
-            params: { query: cleanUser, type: 'users' },
-            headers,
-            timeout: 15000
-        });
-        const rawStr = JSON.stringify(res.data || {});
-        const escapedUser = cleanUser.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // 2. Busca pelo endpoint Search da threads21 com os parâmetros exatos (q, mode, first)
+    const modesToTry = ['profiles', 'users', 'top'];
+    const escapedUser = cleanUser.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-        const userRegex = new RegExp(`"username"\\s*:\\s*"${escapedUser}"[\\s\\S]{0,1200}?"(?:pk|id|user_id)"\\s*:\\s*"?(\\d+)"?`, 'i');
-        const reverseRegex = new RegExp(`"(?:pk|id|user_id)"\\s*:\\s*"?(\\d+)"?[\\s\\S]{0,1200}?"username"\\s*:\\s*"${escapedUser}"`, 'i');
-        const m = rawStr.match(userRegex) || rawStr.match(reverseRegex);
+    for (const mode of modesToTry) {
+        try {
+            const res = await axios.get(`https://${THREADS_RAPIDAPI_HOST}/api/search`, {
+                params: { q: cleanUser, mode: mode, first: 10 },
+                headers,
+                timeout: 15000
+            });
+            const rawStr = JSON.stringify(res.data || {});
 
-        if (m && m[1]) {
-            threadsUserIdCache.set(cleanUser, m[1]);
-            return m[1];
+            const userRegex = new RegExp(`"username"\\s*:\\s*"${escapedUser}"[\\s\\S]{0,1200}?"(?:pk|id|user_id)"\\s*:\\s*"?(\\d+)"?`, 'i');
+            const reverseRegex = new RegExp(`"(?:pk|id|user_id)"\\s*:\\s*"?(\\d+)"?[\\s\\S]{0,1200}?"username"\\s*:\\s*"${escapedUser}"`, 'i');
+            const m = rawStr.match(userRegex) || rawStr.match(reverseRegex);
+
+            if (m && m[1]) {
+                threadsUserIdCache.set(cleanUser, m[1]);
+                return m[1];
+            }
+        } catch (e) {
+            // tenta próximo mode
         }
-    } catch (e) {
-        // segue para retornar null
     }
 
     return null;

@@ -8,7 +8,7 @@ app.use(cors());
 const IG_RAPIDAPI_HOST = 'instagram-looter2.p.rapidapi.com';
 const TWITTER_RAPIDAPI_HOST = 'twitter-api45.p.rapidapi.com';
 const TIKTOK_RAPIDAPI_HOST = 'tiktok-scraper7.p.rapidapi.com';
-const THREADS_RAPIDAPI_HOST = 'threads-api4.p.rapidapi.com';
+const THREADS_RAPIDAPI_HOST = 'threads21.p.rapidapi.com';
 
 const postsCache = new Map();
 const userIdCache = new Map();
@@ -485,7 +485,7 @@ app.get('/api/latest-tiktok', async (req, res) => {
 });
 
 // ==========================================
-// ROTA THREADS (/api/latest-threads) - VIA RAPIDAPI (threads-api4)
+// ROTA THREADS (/api/latest-threads) - VIA RAPIDAPI (threads21)
 // ==========================================
 
 function findThreadsPosts(obj, depth = 0) {
@@ -493,7 +493,7 @@ function findThreadsPosts(obj, depth = 0) {
 
     if (Array.isArray(obj)) {
         for (const item of obj) {
-            if (item && (item.thread_items || item.post || item.caption || item.text_post_app_info)) {
+            if (item && (item.thread_items || item.post || item.caption || item.text_post_app_info || item.node)) {
                 return obj;
             }
         }
@@ -515,6 +515,7 @@ function findThreadsPosts(obj, depth = 0) {
         obj.data?.threads,
         obj.data?.posts,
         obj.data?.items,
+        obj.data?.edges,
         obj.data?.user?.threads
     ];
 
@@ -541,19 +542,18 @@ async function resolveThreadsUserId(cleanUser, headers) {
     const cachedId = threadsUserIdCache.get(cleanUser);
     if (cachedId) return cachedId;
 
-    // 1. Tenta todos os endpoints de busca/perfil da threads-api4
+    // 1. Tenta endpoints de perfil/busca da threads21
     const profileEndpoints = [
-        { url: `https://${THREADS_RAPIDAPI_HOST}/api/user/detail`, params: { username: cleanUser } },
-        { url: `https://${THREADS_RAPIDAPI_HOST}/api/user/info`, params: { username: cleanUser } },
-        { url: `https://${THREADS_RAPIDAPI_HOST}/api/user/search`, params: { query: cleanUser, username: cleanUser } },
-        { url: `https://${THREADS_RAPIDAPI_HOST}/api/search/users`, params: { query: cleanUser } }
+        { url: `https://${THREADS_RAPIDAPI_HOST}/api/users/${encodeURIComponent(cleanUser)}`, params: {} },
+        { url: `https://${THREADS_RAPIDAPI_HOST}/api/users/profile`, params: { username: cleanUser } },
+        { url: `https://${THREADS_RAPIDAPI_HOST}/api/users/info`, params: { username: cleanUser } },
+        { url: `https://${THREADS_RAPIDAPI_HOST}/api/search/users`, params: { query: cleanUser, q: cleanUser } }
     ];
 
     for (const ep of profileEndpoints) {
         try {
             const res = await axios.get(ep.url, { params: ep.params, headers, timeout: 15000 });
             const rawStr = JSON.stringify(res.data || {});
-            // Procura o ID associado ao username exato no JSON retornado
             const userRegex = new RegExp(`"username"\\s*:\\s*"${cleanUser}"[^{}]{0,300}?"(?:pk|id|user_id)"\\s*:\\s*"?(\\d+)"?`, 'i');
             const reverseRegex = new RegExp(`"(?:pk|id|user_id)"\\s*:\\s*"?(\\d+)"?[^{}]{0,300}?"username"\\s*:\\s*"${cleanUser}"`, 'i');
             const m = rawStr.match(userRegex) || rawStr.match(reverseRegex);
@@ -643,11 +643,8 @@ app.get('/api/latest-threads', async (req, res) => {
             return res.status(404).json({ error: 'Não foi possível localizar o ID numérico deste perfil no Threads.' });
         }
 
-        const response = await axios.get(`https://${THREADS_RAPIDAPI_HOST}/api/user/posts`, {
-            params: {
-                user_id: userId,
-                userId: userId
-            },
+        const response = await axios.get(`https://${THREADS_RAPIDAPI_HOST}/api/users/${encodeURIComponent(userId)}/posts`, {
+            params: { first: 10 },
             headers,
             timeout: 25000
         });
@@ -684,7 +681,7 @@ app.get('/api/latest-threads', async (req, res) => {
         }
 
         const hostUrl = `https://${req.get('host')}`;
-        const finalUsername = post?.user?.username || cleanUser;
+        const finalUsername = post?.user?.username || (/^\d+$/.test(cleanUser) ? 'threads' : cleanUser);
 
         const resultData = {
             username: finalUsername,

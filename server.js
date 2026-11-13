@@ -534,7 +534,7 @@ function findThreadsPosts(obj, depth = 0) {
 }
 
 async function resolveThreadsUserId(cleanUser, headers) {
-    // 0. Se o usuário já passou o ID numérico direto no Tumblr, retorna na hora
+    // 0. Se já for numérico, retorna direto
     if (/^\d+$/.test(cleanUser)) {
         return cleanUser;
     }
@@ -542,20 +542,25 @@ async function resolveThreadsUserId(cleanUser, headers) {
     const cachedId = threadsUserIdCache.get(cleanUser);
     if (cachedId) return cachedId;
 
-    // 1. Tenta endpoints de perfil/busca da threads21
-    const profileEndpoints = [
-        { url: `https://${THREADS_RAPIDAPI_HOST}/api/users/${encodeURIComponent(cleanUser)}`, params: {} },
-        { url: `https://${THREADS_RAPIDAPI_HOST}/api/users/profile`, params: { username: cleanUser } },
-        { url: `https://${THREADS_RAPIDAPI_HOST}/api/users/info`, params: { username: cleanUser } },
-        { url: `https://${THREADS_RAPIDAPI_HOST}/api/search/users`, params: { query: cleanUser, q: cleanUser } }
+    // 1. Busca pelo endpoint Search da threads21 (testa os nomes de parâmetro mais comuns)
+    const searchAttempts = [
+        { url: `https://${THREADS_RAPIDAPI_HOST}/api/search`, params: { query: cleanUser, type: 'users' } },
+        { url: `https://${THREADS_RAPIDAPI_HOST}/api/search`, params: { q: cleanUser } },
+        { url: `https://${THREADS_RAPIDAPI_HOST}/api/search`, params: { query: cleanUser } }
     ];
 
-    for (const ep of profileEndpoints) {
+    for (const attempt of searchAttempts) {
         try {
-            const res = await axios.get(ep.url, { params: ep.params, headers, timeout: 15000 });
+            const res = await axios.get(attempt.url, {
+                params: attempt.params,
+                headers,
+                timeout: 15000
+            });
             const rawStr = JSON.stringify(res.data || {});
-            const userRegex = new RegExp(`"username"\\s*:\\s*"${cleanUser}"[^{}]{0,300}?"(?:pk|id|user_id)"\\s*:\\s*"?(\\d+)"?`, 'i');
-            const reverseRegex = new RegExp(`"(?:pk|id|user_id)"\\s*:\\s*"?(\\d+)"?[^{}]{0,300}?"username"\\s*:\\s*"${cleanUser}"`, 'i');
+
+            // Procura o ID numérico vinculado ao username exato
+            const userRegex = new RegExp(`"username"\\s*:\\s*"${cleanUser}"[^{}]{0,400}?"(?:pk|id|user_id)"\\s*:\\s*"?(\\d+)"?`, 'i');
+            const reverseRegex = new RegExp(`"(?:pk|id|user_id)"\\s*:\\s*"?(\\d+)"?[^{}]{0,400}?"username"\\s*:\\s*"${cleanUser}"`, 'i');
             const m = rawStr.match(userRegex) || rawStr.match(reverseRegex);
 
             if (m && m[1]) {
@@ -563,53 +568,37 @@ async function resolveThreadsUserId(cleanUser, headers) {
                 return m[1];
             }
         } catch (e) {
-            // tenta próximo endpoint
+            // tenta o próximo formato de parâmetro
         }
     }
 
-    // 2. Fallback via Instagram Looter2 (o ID numérico da conta Meta/Threads é o mesmo do Instagram)
-    try {
-        const igCachedId = userIdCache.get(cleanUser);
-        if (igCachedId) {
-            threadsUserIdCache.set(cleanUser, String(igCachedId));
-            return String(igCachedId);
-        }
+    // 2. Fallback via HTML público do Threads (threads.net e threads.com)
+    const publicUrls = [
+        `https://www.threads.net/@${encodeURIComponent(cleanUser)}`,
+        `https://www.threads.com/@${encodeURIComponent(cleanUser)}`
+    ];
 
-        const igRes = await axios.get(`https://${IG_RAPIDAPI_HOST}/profile`, {
-            params: { username: cleanUser },
-            headers: {
-                'x-rapidapi-key': headers['x-rapidapi-key'],
-                'x-rapidapi-host': IG_RAPIDAPI_HOST
-            },
-            timeout: 15000
-        });
-        const igId = igRes.data?.id || igRes.data?.user?.id;
-        if (igId && /^\d+$/.test(String(igId))) {
-            userIdCache.set(cleanUser, String(igId));
-            threadsUserIdCache.set(cleanUser, String(igId));
-            return String(igId);
-        }
-    } catch (e) {
-        // segue para o fallback HTML
-    }
+    for (const pageUrl of publicUrls) {
+        try {
+            const pageRes = await axios.get(pageUrl, {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml'
+                },
+                timeout: 15000
+            });
+            const html = String(pageRes.data || '');
+            const match = html.match(/"user_id":"(\d+)"/)
+                || html.match(/"props":\{"user_id":"(\d+)"/)
+                || html.match(/"id":"(\d+)","username":"[^"]+"/);
 
-    // 3. Fallback HTML público do Threads
-    try {
-        const pageRes = await axios.get(`https://www.threads.net/@${encodeURIComponent(cleanUser)}`, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml'
-            },
-            timeout: 15000
-        });
-        const html = String(pageRes.data || '');
-        const match = html.match(/"user_id":"(\d+)"/) || html.match(/"props":\{"user_id":"(\d+)"/);
-        if (match && match[1]) {
-            threadsUserIdCache.set(cleanUser, match[1]);
-            return match[1];
+            if (match && match[1]) {
+                threadsUserIdCache.set(cleanUser, match[1]);
+                return match[1];
+            }
+        } catch (e) {
+            // tenta próxima URL
         }
-    } catch (e) {
-        // segue para retornar null
     }
 
     return null;

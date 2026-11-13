@@ -120,12 +120,17 @@ async function resolveYoutubeChannelId(input) {
     const res = await axios.get(`https://www.youtube.com/${encodeURI(handle)}`, {
         headers: {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Accept-Language': 'en-US,en;q=0.9'
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Cookie': 'CONSENT=YES+cb.20210328-17-p0.en+FX+999'
         },
         timeout: 15000
     });
 
-    const match = res.data.match(/"externalId":"(UC[\w-]{22})"/);
+    const html = String(res.data || '');
+    const match = html.match(/"externalId":"(UC[\w-]{22})"/)
+        || html.match(/youtube\.com\/channel\/(UC[\w-]{22})/)
+        || html.match(/"channelId":"(UC[\w-]{22})"/);
+
     if (match && match[1]) {
         youtubeIdCache.set(clean.toLowerCase(), match[1]);
         return match[1];
@@ -223,12 +228,9 @@ app.get('/api/latest-post', async (req, res) => {
             ? `https://www.instagram.com/p/${postCode}/`
             : `https://www.instagram.com/${cleanUser}/`;
 
-        const hostUrl = `https://${req.get('host')}`;
-        const proxiedImageUrl = `${hostUrl}/api/image-proxy?url=${encodeURIComponent(rawImageUrl)}`;
-
         const resultData = {
             username: cleanUser,
-            media_url: proxiedImageUrl,
+            media_url: rawImageUrl,
             caption: caption,
             permalink: permalink
         };

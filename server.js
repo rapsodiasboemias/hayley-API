@@ -713,6 +713,56 @@ app.get('/api/image-proxy', async (req, res) => {
 });
 
 // ==========================================
+// ROTA DISCORD (/api/discord-invite) - COM CACHE DE 30 MINUTOS
+// ==========================================
+
+const discordCache = new Map();
+const DISCORD_CACHE_TTL = 30 * 60 * 1000; // 30 minutos
+
+app.get('/api/discord-invite', async (req, res) => {
+    const { code } = req.query;
+    if (!code) {
+        return res.status(400).json({ error: 'Código de convite obrigatório.' });
+    }
+
+    const cleanCode = code.trim().split('/').pop().split('?')[0].trim();
+    const cached = discordCache.get(cleanCode);
+    if (cached && (Date.now() - cached.timestamp < DISCORD_CACHE_TTL)) {
+        return res.json(cached.data);
+    }
+
+    try {
+        const dcRes = await axios.get(`https://discord.com/api/v9/invites/${encodeURIComponent(cleanCode)}?with_counts=true`, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+            },
+            timeout: 15000
+        });
+
+        const data = dcRes.data;
+        if (!data || !data.guild) {
+            return res.status(404).json({ error: 'Convite inválido ou expirado.' });
+        }
+
+        const resultData = {
+            guild: {
+                id: data.guild.id,
+                name: data.guild.name,
+                icon: data.guild.icon
+            },
+            approximate_presence_count: data.approximate_presence_count,
+            approximate_member_count: data.approximate_member_count
+        };
+
+        discordCache.set(cleanCode, { timestamp: Date.now(), data: resultData });
+        return res.json(resultData);
+    } catch (error) {
+        console.error(`Erro Discord (${cleanCode}):`, error.response?.status, error.message);
+        return res.status(error.response?.status || 500).json({ error: 'Falha ao consultar Discord.' });
+    }
+});
+
+// ==========================================
 // INICIALIZAÇÃO DO SERVIDOR
 // ==========================================
 

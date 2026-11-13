@@ -542,37 +542,45 @@ async function resolveThreadsUserId(cleanUser, headers) {
     const cachedId = threadsUserIdCache.get(cleanUser);
     if (cachedId) return cachedId;
 
-    // 1. Busca pelo endpoint Search da threads21 (testa os nomes de parâmetro mais comuns)
-    const searchAttempts = [
-        { url: `https://${THREADS_RAPIDAPI_HOST}/api/search`, params: { query: cleanUser, type: 'users' } },
-        { url: `https://${THREADS_RAPIDAPI_HOST}/api/search`, params: { q: cleanUser } },
-        { url: `https://${THREADS_RAPIDAPI_HOST}/api/search`, params: { query: cleanUser } }
-    ];
+    // 1. Busca pelo endpoint Search da threads21 (inclusive buscando sem "_" caso a busca quebre com underscore)
+    const searchTerms = [cleanUser];
+    if (cleanUser.includes('_')) {
+        searchTerms.push(cleanUser.replace(/_/g, ' '));
+    }
 
-    for (const attempt of searchAttempts) {
-        try {
-            const res = await axios.get(attempt.url, {
-                params: attempt.params,
-                headers,
-                timeout: 15000
-            });
-            const rawStr = JSON.stringify(res.data || {});
+    for (const term of searchTerms) {
+        const searchAttempts = [
+            { url: `https://${THREADS_RAPIDAPI_HOST}/api/search`, params: { query: term, type: 'users' } },
+            { url: `https://${THREADS_RAPIDAPI_HOST}/api/search`, params: { q: term } },
+            { url: `https://${THREADS_RAPIDAPI_HOST}/api/search`, params: { query: term } }
+        ];
 
-            // Procura o ID numérico vinculado ao username exato
-            const userRegex = new RegExp(`"username"\\s*:\\s*"${cleanUser}"[^{}]{0,400}?"(?:pk|id|user_id)"\\s*:\\s*"?(\\d+)"?`, 'i');
-            const reverseRegex = new RegExp(`"(?:pk|id|user_id)"\\s*:\\s*"?(\\d+)"?[^{}]{0,400}?"username"\\s*:\\s*"${cleanUser}"`, 'i');
-            const m = rawStr.match(userRegex) || rawStr.match(reverseRegex);
+        for (const attempt of searchAttempts) {
+            try {
+                const res = await axios.get(attempt.url, {
+                    params: attempt.params,
+                    headers,
+                    timeout: 15000
+                });
+                const rawStr = JSON.stringify(res.data || {});
+                const escapedUser = cleanUser.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-            if (m && m[1]) {
-                threadsUserIdCache.set(cleanUser, m[1]);
-                return m[1];
+                // Busca o ID numérico vinculado ao username exato (com ou sem aspas no número, com janela ampla)
+                const userRegex = new RegExp(`"username"\\s*:\\s*"${escapedUser}"[\\s\\S]{0,1200}?"(?:pk|id|user_id)"\\s*:\\s*"?(\\d+)"?`, 'i');
+                const reverseRegex = new RegExp(`"(?:pk|id|user_id)"\\s*:\\s*"?(\\d+)"?[\\s\\S]{0,1200}?"username"\\s*:\\s*"${escapedUser}"`, 'i');
+                const m = rawStr.match(userRegex) || rawStr.match(reverseRegex);
+
+                if (m && m[1]) {
+                    threadsUserIdCache.set(cleanUser, m[1]);
+                    return m[1];
+                }
+            } catch (e) {
+                // tenta o próximo formato
             }
-        } catch (e) {
-            // tenta o próximo formato de parâmetro
         }
     }
 
-    // 2. Fallback via HTML público do Threads (threads.net e threads.com)
+    // 2. Fallback via HTML público do Threads (threads.net e threads.com) com múltiplos padrões de ID
     const publicUrls = [
         `https://www.threads.net/@${encodeURIComponent(cleanUser)}`,
         `https://www.threads.com/@${encodeURIComponent(cleanUser)}`
@@ -583,14 +591,21 @@ async function resolveThreadsUserId(cleanUser, headers) {
             const pageRes = await axios.get(pageUrl, {
                 headers: {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml'
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Sec-Fetch-Site': 'none',
+                    'Sec-Fetch-Mode': 'navigate'
                 },
                 timeout: 15000
             });
             const html = String(pageRes.data || '');
-            const match = html.match(/"user_id":"(\d+)"/)
-                || html.match(/"props":\{"user_id":"(\d+)"/)
-                || html.match(/"id":"(\d+)","username":"[^"]+"/);
+            const escapedUser = cleanUser.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+            const match = html.match(/"user_id"\s*:\s*"(\d+)"/)
+                || html.match(/"props"\s*:\s*\{"user_id"\s*:\s*"(\d+)"/)
+                || html.match(new RegExp(`"pk"\\s*:\\s*"(\\d+)"[\\s\\S]{0,300}?"username"\\s*:\\s*"${escapedUser}"`, 'i'))
+                || html.match(new RegExp(`"username"\\s*:\\s*"${escapedUser}"[\\s\\S]{0,300}?"pk"\\s*:\\s*"(\\d+)"`, 'i'))
+                || html.match(/threads:\/\/user\?id=(\d+)/i);
 
             if (match && match[1]) {
                 threadsUserIdCache.set(cleanUser, match[1]);

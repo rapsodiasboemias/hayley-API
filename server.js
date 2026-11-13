@@ -653,7 +653,11 @@ app.get('/api/latest-threads', async (req, res) => {
                 if (Array.isArray(found) && found.length > 0) {
                     const extracted = found.map((entry) => {
                         const item = entry?.node || entry;
-                        return item?.thread_items?.[0]?.post || item?.post || item;
+                        const postObj = item?.thread_items?.[0]?.post || item?.post || item;
+                        if (postObj && typeof postObj === 'object') {
+                            postObj._rawEntry = item;
+                        }
+                        return postObj;
                     }).filter(Boolean);
 
                     if (!ep.isSearch) {
@@ -690,6 +694,7 @@ app.get('/api/latest-threads', async (req, res) => {
 
         validPosts.sort((a, b) => (Number(b?.taken_at) || 0) - (Number(a?.taken_at) || 0));
         const post = validPosts[0];
+        const firstEntry = post?._rawEntry || post;
 
         const captionText = typeof post?.caption === 'string'
             ? post.caption
@@ -697,14 +702,34 @@ app.get('/api/latest-threads', async (req, res) => {
         const postCode = post?.code || post?.shortcode || post?.pk || post?.id;
 
         let rawMedia = null;
-        if (Array.isArray(post?.carousel_media) && post.carousel_media.length > 0) {
-            rawMedia = post.carousel_media[0]?.image_versions2?.candidates?.[0]?.url
-                || post.carousel_media[0]?.display_url
-                || null;
-        } else if (post?.image_versions2?.candidates?.[0]?.url) {
-            rawMedia = post.image_versions2.candidates[0].url;
-        } else if (post?.display_url || post?.thumbnail_url || post?.image_url) {
-            rawMedia = post.display_url || post.thumbnail_url || post.image_url;
+        const candidatePosts = [post];
+        if (Array.isArray(firstEntry?.thread_items)) {
+            for (const ti of firstEntry.thread_items) {
+                if (ti?.post) candidatePosts.push(ti.post);
+            }
+        }
+
+        for (const p of candidatePosts) {
+            if (!p) continue;
+            if (Array.isArray(p.carousel_media) && p.carousel_media.length > 0) {
+                rawMedia = p.carousel_media[0]?.image_versions2?.candidates?.[0]?.url
+                    || p.carousel_media[0]?.display_url
+                    || null;
+            }
+            if (!rawMedia && p.image_versions2?.candidates?.[0]?.url) {
+                rawMedia = p.image_versions2.candidates[0].url;
+            }
+            if (!rawMedia && p.text_post_app_info?.link_preview_attachment) {
+                const lp = p.text_post_app_info.link_preview_attachment;
+                rawMedia = lp.image_url
+                    || lp.display_url
+                    || lp.image_versions2?.candidates?.[0]?.url
+                    || null;
+            }
+            if (!rawMedia && (p.display_url || p.thumbnail_url || p.image_url)) {
+                rawMedia = p.display_url || p.thumbnail_url || p.image_url;
+            }
+            if (rawMedia) break;
         }
 
         const hostUrl = `https://${req.get('host')}`;

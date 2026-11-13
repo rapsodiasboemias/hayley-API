@@ -327,7 +327,7 @@ app.get('/api/latest-tweet', async (req, res) => {
 });
 
 // ==========================================
-// ROTA YOUTUBE (/api/latest-youtube)
+// ROTA YOUTUBE (/api/latest-youtube) - 100% GRATUITA
 // ==========================================
 
 app.get('/api/latest-youtube', async (req, res) => {

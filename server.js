@@ -20,7 +20,7 @@ const threadsCache = new Map();
 const threadsUserIdCache = new Map();
 
 const CACHE_TTL = 12 * 60 * 60 * 1000;       // 12h para YouTube e Twitter/X
-const SHORT_CACHE_TTL = 2 * 60 * 60 * 1000;  // 2h para Instagram, Threads e TikTok
+const SHORT_CACHE_TTL = 4 * 60 * 60 * 1000;  // 4h para Instagram, Threads e TikTok
 
 setInterval(() => {
     const now = Date.now();
@@ -327,8 +327,73 @@ app.get('/api/latest-tweet', async (req, res) => {
 });
 
 // ==========================================
-// ROTA YOUTUBE (/api/latest-youtube) - 100% GRATUITA
+// ROTA YOUTUBE (/api/latest-youtube) - RSS XML PRIMEIRO (ESTÁVEL)
 // ==========================================
+
+async function resolveYoutubeChannelId(cleanInput, ytHeaders) {
+    if (/^UC[\w-]{22}$/.test(cleanInput)) {
+        return cleanInput;
+    }
+
+    const cacheKey = cleanInput.toLowerCase();
+    const cachedId = youtubeIdCache.get(cacheKey);
+    if (cachedId) return cachedId;
+
+    const bareName = cleanInput.replace(/^@/, '');
+    const candidateUrls = [
+        `https://www.youtube.com/@${encodeURI(bareName)}`,
+        `https://www.youtube.com/c/${encodeURI(bareName)}`,
+        `https://www.youtube.com/user/${encodeURI(bareName)}`
+    ];
+
+    for (const pageUrl of candidateUrls) {
+        try {
+            const pageRes = await axios.get(pageUrl, { headers: ytHeaders, timeout: 15000 });
+            const html = String(pageRes.data || '');
+
+            const idMatch = html.match(/"externalId"\s*:\s*"(UC[\w-]{22})"/)
+                || html.match(/"channelId"\s*:\s*"(UC[\w-]{22})"/)
+                || html.match(/\/channel\/(UC[\w-]{22})/)
+                || html.match(/channel_id=(UC[\w-]{22})/);
+
+            if (idMatch && idMatch[1]) {
+                youtubeIdCache.set(cacheKey, idMatch[1]);
+                return idMatch[1];
+            }
+        } catch (e) {
+            // tenta a próxima variação de URL
+        }
+    }
+
+    return null;
+}
+
+async function fetchYoutubeFromRss(channelId, ytHeaders, hostUrl) {
+    const feedUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${encodeURIComponent(channelId)}`;
+    const feedRes = await axios.get(feedUrl, { headers: ytHeaders, timeout: 15000 });
+    const xml = String(feedRes.data || '');
+
+    const authorMatch = xml.match(/<author>\s*<name>([\s\S]*?)<\/name>/);
+    const entryMatch = xml.match(/<entry>([\s\S]*?)<\/entry>/);
+    const videoIdMatch = entryMatch?.[1]?.match(/<yt:videoId>([\s\S]*?)<\/yt:videoId>/);
+    const titleMatch = entryMatch?.[1]?.match(/<title>([\s\S]*?)<\/title>/);
+    const publishedMatch = entryMatch?.[1]?.match(/<published>([\s\S]*?)<\/published>/);
+
+    if (!videoIdMatch) return null;
+
+    const videoId = videoIdMatch[1].trim();
+    const rawThumb = `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`;
+
+    return {
+        channel_id: channelId,
+        channel_name: authorMatch ? decodeXmlEntities(authorMatch[1].trim()) : channelId,
+        video_id: videoId,
+        title: titleMatch ? decodeXmlEntities(titleMatch[1].trim()) : 'Último vídeo',
+        thumbnail_url: `${hostUrl}/api/image-proxy?url=${encodeURIComponent(rawThumb)}`,
+        published_at: publishedMatch ? publishedMatch[1].trim() : null,
+        permalink: `https://www.youtube.com/watch?v=${videoId}`
+    };
+}
 
 function extractFirstVideoFromYtInitialData(html) {
     const match = html.match(/var ytInitialData\s*=\s*(\{[\s\S]*?\});\s*<\/script>/)
@@ -384,17 +449,30 @@ app.get('/api/latest-youtube', async (req, res) => {
     const ytHeaders = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Accept-Language': 'en-US,en;q=0.9',
         'Cookie': 'CONSENT=YES+cb.20210328-17-p0.en+FX+999; SOCS=CAI'
     };
 
     const hostUrl = `https://${req.get('host')}`;
-    const isUcId = /^UC[\w-]{22}$/.test(clean);
     const bareName = clean.replace(/^@/, '');
 
-    // 1. Tenta extrair direto da aba /videos da página pública do canal
-    const videosPageUrls = isUcId
-        ? [`https://www.youtube.com/channel/${clean}/videos`]
+    // 1. PRIORIDADE: Converte @handle -> ID UC... e lê o Feed RSS XML oficial (sem bloqueio)
+    const resolvedChannelId = await resolveYoutubeChannelId(clean, ytHeaders);
+    if (resolvedChannelId) {
+        try {
+            const rssData = await fetchYoutubeFromRss(resolvedChannelId, ytHeaders, hostUrl);
+            if (rssData) {
+                youtubeCache.set(cacheKey, { timestamp: Date.now(), data: rssData });
+                return res.json(rssData);
+            }
+        } catch (e) {
+            console.warn(`RSS YouTube falhou para ${resolvedChannelId}:`, e.message);
+        }
+    }
+
+    // 2. FALLBACK: Tenta extrair direto da aba /videos caso o RSS falhe
+    const videosPageUrls = resolvedChannelId
+        ? [`https://www.youtube.com/channel/${resolvedChannelId}/videos`]
         : [
             `https://www.youtube.com/@${encodeURI(bareName)}/videos`,
             `https://www.youtube.com/c/${encodeURI(bareName)}/videos`,
@@ -407,9 +485,14 @@ app.get('/api/latest-youtube', async (req, res) => {
             const extracted = extractFirstVideoFromYtInitialData(String(pageRes.data || ''));
 
             if (extracted && extracted.video_id) {
+                const finalId = extracted.channel_id || resolvedChannelId;
+                if (finalId) {
+                    youtubeIdCache.set(cacheKey, finalId);
+                }
+
                 const rawThumb = `https://i.ytimg.com/vi/${extracted.video_id}/mqdefault.jpg`;
                 const resultData = {
-                    channel_id: extracted.channel_id || (isUcId ? clean : null),
+                    channel_id: finalId,
                     channel_name: extracted.channel_name || bareName,
                     video_id: extracted.video_id,
                     title: extracted.title || 'Último vídeo',
@@ -422,40 +505,7 @@ app.get('/api/latest-youtube', async (req, res) => {
                 return res.json(resultData);
             }
         } catch (e) {
-            // segue para próxima URL ou fallback RSS
-        }
-    }
-
-    // 2. Fallback via RSS oficial caso o usuário tenha passado um ID UC... direto
-    if (isUcId) {
-        try {
-            const feedUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${clean}`;
-            const feedRes = await axios.get(feedUrl, { headers: ytHeaders, timeout: 15000 });
-            const xml = String(feedRes.data || '');
-
-            const authorMatch = xml.match(/<author>\s*<name>([\s\S]*?)<\/name>/);
-            const entryMatch = xml.match(/<entry>([\s\S]*?)<\/entry>/);
-            const videoIdMatch = entryMatch?.[1]?.match(/<yt:videoId>([\s\S]*?)<\/yt:videoId>/);
-            const titleMatch = entryMatch?.[1]?.match(/<title>([\s\S]*?)<\/title>/);
-
-            if (videoIdMatch) {
-                const videoId = videoIdMatch[1].trim();
-                const rawThumb = `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`;
-                const resultData = {
-                    channel_id: clean,
-                    channel_name: authorMatch ? decodeXmlEntities(authorMatch[1].trim()) : clean,
-                    video_id: videoId,
-                    title: titleMatch ? decodeXmlEntities(titleMatch[1].trim()) : 'Último vídeo',
-                    thumbnail_url: `${hostUrl}/api/image-proxy?url=${encodeURIComponent(rawThumb)}`,
-                    published_at: null,
-                    permalink: `https://www.youtube.com/watch?v=${videoId}`
-                };
-
-                youtubeCache.set(cacheKey, { timestamp: Date.now(), data: resultData });
-                return res.json(resultData);
-            }
-        } catch (e) {
-            // cai no 404 final
+            // segue para o 404 final
         }
     }
 
@@ -585,7 +635,7 @@ async function resolveThreadsUserId(cleanUser, headers) {
 
     const escapedUser = cleanUser.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-    // 1. HTML público do Threads (custo 0)
+    // 1. HTML público do Threads (custo 0 de cota)
     const publicUrls = [
         `https://www.threads.net/@${encodeURIComponent(cleanUser)}`,
         `https://www.threads.com/@${encodeURIComponent(cleanUser)}`
@@ -669,14 +719,11 @@ app.get('/api/latest-threads', async (req, res) => {
         const postEndpoints = [];
         if (userId) {
             postEndpoints.push(
-                { url: `https://${THREADS_RAPIDAPI_HOST}/api/users/${encodeURIComponent(userId)}/posts`, params: { first: 10 }, isSearch: false },
-                { url: `https://${THREADS_RAPIDAPI_HOST}/api/users/${encodeURIComponent(userId)}/media`, params: { first: 10 }, isSearch: false },
-                { url: `https://${THREADS_RAPIDAPI_HOST}/api/users/${encodeURIComponent(userId)}/reposts`, params: { first: 10 }, isSearch: false }
+                { url: `https://${THREADS_RAPIDAPI_HOST}/api/users/${encodeURIComponent(userId)}/posts`, params: { first: 10 }, isSearch: false }
             );
         }
         postEndpoints.push(
-            { url: `https://${THREADS_RAPIDAPI_HOST}/api/search`, params: { q: cleanUser, mode: 'recent', first: 20 }, isSearch: true },
-            { url: `https://${THREADS_RAPIDAPI_HOST}/api/search`, params: { q: cleanUser, mode: 'top', first: 20 }, isSearch: true }
+            { url: `https://${THREADS_RAPIDAPI_HOST}/api/search`, params: { q: cleanUser, mode: 'recent', first: 20 }, isSearch: true }
         );
 
         let validPosts = [];

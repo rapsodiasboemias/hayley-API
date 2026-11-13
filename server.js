@@ -327,189 +327,66 @@ app.get('/api/latest-tweet', async (req, res) => {
 });
 
 // ==========================================
-// ROTA YOUTUBE (/api/latest-youtube) - RSS XML PRIMEIRO (ESTÁVEL)
+// ROTA YOUTUBE (/api/latest-youtube)
 // ==========================================
-
-async function resolveYoutubeChannelId(cleanInput, ytHeaders) {
-    if (/^UC[\w-]{22}$/.test(cleanInput)) {
-        return cleanInput;
-    }
-
-    const cacheKey = cleanInput.toLowerCase();
-    const cachedId = youtubeIdCache.get(cacheKey);
-    if (cachedId) return cachedId;
-
-    const bareName = cleanInput.replace(/^@/, '');
-    const candidateUrls = [
-        `https://www.youtube.com/@${encodeURI(bareName)}`,
-        `https://www.youtube.com/c/${encodeURI(bareName)}`,
-        `https://www.youtube.com/user/${encodeURI(bareName)}`
-    ];
-
-    for (const pageUrl of candidateUrls) {
-        try {
-            const pageRes = await axios.get(pageUrl, { headers: ytHeaders, timeout: 15000 });
-            const html = String(pageRes.data || '');
-
-            const idMatch = html.match(/"externalId"\s*:\s*"(UC[\w-]{22})"/)
-                || html.match(/"channelId"\s*:\s*"(UC[\w-]{22})"/)
-                || html.match(/\/channel\/(UC[\w-]{22})/)
-                || html.match(/channel_id=(UC[\w-]{22})/);
-
-            if (idMatch && idMatch[1]) {
-                youtubeIdCache.set(cacheKey, idMatch[1]);
-                return idMatch[1];
-            }
-        } catch (e) {
-            // tenta a próxima variação de URL
-        }
-    }
-
-    return null;
-}
-
-async function fetchYoutubeFromRss(channelId, ytHeaders, hostUrl) {
-    const feedUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${encodeURIComponent(channelId)}`;
-    const feedRes = await axios.get(feedUrl, { headers: ytHeaders, timeout: 15000 });
-    const xml = String(feedRes.data || '');
-
-    const authorMatch = xml.match(/<author>\s*<name>([\s\S]*?)<\/name>/);
-    const entryMatch = xml.match(/<entry>([\s\S]*?)<\/entry>/);
-    const videoIdMatch = entryMatch?.[1]?.match(/<yt:videoId>([\s\S]*?)<\/yt:videoId>/);
-    const titleMatch = entryMatch?.[1]?.match(/<title>([\s\S]*?)<\/title>/);
-    const publishedMatch = entryMatch?.[1]?.match(/<published>([\s\S]*?)<\/published>/);
-
-    if (!videoIdMatch) return null;
-
-    const videoId = videoIdMatch[1].trim();
-    const rawThumb = `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`;
-
-    return {
-        channel_id: channelId,
-        channel_name: authorMatch ? decodeXmlEntities(authorMatch[1].trim()) : channelId,
-        video_id: videoId,
-        title: titleMatch ? decodeXmlEntities(titleMatch[1].trim()) : 'Último vídeo',
-        thumbnail_url: `${hostUrl}/api/image-proxy?url=${encodeURIComponent(rawThumb)}`,
-        published_at: publishedMatch ? publishedMatch[1].trim() : null,
-        permalink: `https://www.youtube.com/watch?v=${videoId}`
-    };
-}
-
-function extractFirstVideoFromYtInitialData(html) {
-    const match = html.match(/var ytInitialData\s*=\s*(\{[\s\S]*?\});\s*<\/script>/)
-        || html.match(/window\["ytInitialData"\]\s*=\s*(\{[\s\S]*?\});\s*<\/script>/);
-    if (!match) return null;
-
-    try {
-        const data = JSON.parse(match[1]);
-        const channelName = data?.metadata?.channelMetadataRenderer?.title
-            || data?.header?.c4TabbedHeaderRenderer?.title
-            || null;
-        const channelId = data?.metadata?.channelMetadataRenderer?.externalId
-            || data?.header?.c4TabbedHeaderRenderer?.channelId
-            || null;
-
-        const rawStr = match[1];
-        const videoMatch = rawStr.match(/"videoRenderer"\s*:\s*\{"videoId"\s*:\s*"([\w-]{11})"[\s\S]{0,1500}?"title"\s*:\s*\{"runs"\s*:\s*\[\{"text"\s*:\s*"((?:\\"|[^"])+)"/);
-
-        if (videoMatch && videoMatch[1]) {
-            return {
-                channel_id: channelId,
-                channel_name: channelName,
-                video_id: videoMatch[1],
-                title: JSON.parse(`"${videoMatch[2]}"`)
-            };
-        }
-    } catch (e) {
-        return null;
-    }
-    return null;
-}
 
 app.get('/api/latest-youtube', async (req, res) => {
     const { channel } = req.query;
     if (!channel) {
-        return res.status(400).json({ error: 'Parâmetro channel (ID UC... ou @handle) é obrigatório.' });
+        return res.status(400).json({ error: 'Parâmetro channel (ID UC...) é obrigatório.' });
     }
 
-    let clean = channel.trim().replace(/\/+$/, '');
-    const urlUcMatch = clean.match(/youtube\.com\/channel\/(UC[\w-]{22})/i);
-    if (urlUcMatch) clean = urlUcMatch[1];
-    const urlHandleMatch = clean.match(/youtube\.com\/(@[^/?#]+)/i);
-    if (urlHandleMatch) clean = urlHandleMatch[1];
-    const urlCustomMatch = clean.match(/youtube\.com\/(?:c|user)\/([^/?#]+)/i);
-    if (urlCustomMatch) clean = urlCustomMatch[1];
+    const ucMatch = channel.trim().match(/(UC[\w-]{22})/);
+    if (!ucMatch) {
+        return res.status(400).json({ error: 'Informe um ID de canal válido começando com UC.' });
+    }
 
-    const cacheKey = clean.toLowerCase();
-    const cached = youtubeCache.get(cacheKey);
+    const channelId = ucMatch[1];
+    const cached = youtubeCache.get(channelId);
     if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
         return res.json(cached.data);
     }
 
-    const ytHeaders = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Cookie': 'CONSENT=YES+cb.20210328-17-p0.en+FX+999; SOCS=CAI'
-    };
+    try {
+        const feedUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
+        const feedRes = await axios.get(feedUrl, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (compatible; FeedReader/1.0)',
+                'Accept': 'application/atom+xml,application/xml,text/xml,*/*;q=0.8'
+            },
+            timeout: 15000
+        });
 
-    const hostUrl = `https://${req.get('host')}`;
-    const bareName = clean.replace(/^@/, '');
+        const xml = String(feedRes.data || '');
+        const authorMatch = xml.match(/<author>\s*<name>([\s\S]*?)<\/name>/);
+        const entryMatch = xml.match(/<entry>([\s\S]*?)<\/entry>/);
+        const videoIdMatch = entryMatch?.[1]?.match(/<yt:videoId>([\s\S]*?)<\/yt:videoId>/);
+        const titleMatch = entryMatch?.[1]?.match(/<title>([\s\S]*?)<\/title>/);
 
-    // 1. PRIORIDADE: Converte @handle -> ID UC... e lê o Feed RSS XML oficial (sem bloqueio)
-    const resolvedChannelId = await resolveYoutubeChannelId(clean, ytHeaders);
-    if (resolvedChannelId) {
-        try {
-            const rssData = await fetchYoutubeFromRss(resolvedChannelId, ytHeaders, hostUrl);
-            if (rssData) {
-                youtubeCache.set(cacheKey, { timestamp: Date.now(), data: rssData });
-                return res.json(rssData);
-            }
-        } catch (e) {
-            console.warn(`RSS YouTube falhou para ${resolvedChannelId}:`, e.message);
+        if (!videoIdMatch) {
+            return res.status(404).json({ error: 'Nenhum vídeo encontrado no feed RSS.' });
         }
+
+        const videoId = videoIdMatch[1].trim();
+        const resultData = {
+            channel_id: channelId,
+            channel_name: authorMatch ? decodeXmlEntities(authorMatch[1].trim()) : channelId,
+            video_id: videoId,
+            title: titleMatch ? decodeXmlEntities(titleMatch[1].trim()) : 'Watch on YouTube',
+            thumbnail_url: `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
+            permalink: `https://www.youtube.com/watch?v=${videoId}`
+        };
+
+        youtubeCache.set(channelId, { timestamp: Date.now(), data: resultData });
+        return res.json(resultData);
+
+    } catch (error) {
+        console.error(`Erro RSS YouTube (${channelId}):`, error.response?.status, error.message);
+        return res.status(500).json({
+            error: 'Falha ao ler RSS do YouTube.',
+            status_code: error.response?.status || 500
+        });
     }
-
-    // 2. FALLBACK: Tenta extrair direto da aba /videos caso o RSS falhe
-    const videosPageUrls = resolvedChannelId
-        ? [`https://www.youtube.com/channel/${resolvedChannelId}/videos`]
-        : [
-            `https://www.youtube.com/@${encodeURI(bareName)}/videos`,
-            `https://www.youtube.com/c/${encodeURI(bareName)}/videos`,
-            `https://www.youtube.com/user/${encodeURI(bareName)}/videos`
-        ];
-
-    for (const pageUrl of videosPageUrls) {
-        try {
-            const pageRes = await axios.get(pageUrl, { headers: ytHeaders, timeout: 15000 });
-            const extracted = extractFirstVideoFromYtInitialData(String(pageRes.data || ''));
-
-            if (extracted && extracted.video_id) {
-                const finalId = extracted.channel_id || resolvedChannelId;
-                if (finalId) {
-                    youtubeIdCache.set(cacheKey, finalId);
-                }
-
-                const rawThumb = `https://i.ytimg.com/vi/${extracted.video_id}/mqdefault.jpg`;
-                const resultData = {
-                    channel_id: finalId,
-                    channel_name: extracted.channel_name || bareName,
-                    video_id: extracted.video_id,
-                    title: extracted.title || 'Último vídeo',
-                    thumbnail_url: `${hostUrl}/api/image-proxy?url=${encodeURIComponent(rawThumb)}`,
-                    published_at: null,
-                    permalink: `https://www.youtube.com/watch?v=${extracted.video_id}`
-                };
-
-                youtubeCache.set(cacheKey, { timestamp: Date.now(), data: resultData });
-                return res.json(resultData);
-            }
-        } catch (e) {
-            // segue para o 404 final
-        }
-    }
-
-    return res.status(404).json({ error: 'Não foi possível carregar os vídeos deste canal do YouTube.' });
 });
 
 // ==========================================

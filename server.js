@@ -478,6 +478,8 @@ app.get('/api/latest-tiktok', async (req, res) => {
 // ROTA THREADS (/api/latest-threads) - VIA RAPIDAPI (threads-api4)
 // ==========================================
 
+const threadsUserIdCache = new Map();
+
 function findThreadsPosts(obj, depth = 0) {
     if (!obj || typeof obj !== 'object' || depth > 6) return [];
 
@@ -522,6 +524,57 @@ function findThreadsPosts(obj, depth = 0) {
     return [];
 }
 
+async function resolveThreadsUserId(cleanUser, headers) {
+    const cachedId = threadsUserIdCache.get(cleanUser);
+    if (cachedId) return cachedId;
+
+    // 1. Tenta via endpoint de perfil da threads-api4
+    const profileEndpoints = [
+        { url: `https://${THREADS_RAPIDAPI_HOST}/api/user/info`, params: { username: cleanUser } },
+        { url: `https://${THREADS_RAPIDAPI_HOST}/api/user/profile`, params: { username: cleanUser } },
+        { url: `https://${THREADS_RAPIDAPI_HOST}/api/user/id`, params: { username: cleanUser } }
+    ];
+
+    for (const ep of profileEndpoints) {
+        try {
+            const res = await axios.get(ep.url, { params: ep.params, headers, timeout: 15000 });
+            const d = res.data || {};
+            const id = d.user_id || d.id || d.pk
+                || d.data?.user_id || d.data?.id || d.data?.pk
+                || d.data?.user?.id || d.data?.user?.pk
+                || d.user?.id || d.user?.pk;
+
+            if (id && /^\d+$/.test(String(id))) {
+                threadsUserIdCache.set(cleanUser, String(id));
+                return String(id);
+            }
+        } catch (e) {
+            // tenta próximo endpoint
+        }
+    }
+
+    // 2. Fallback gratuito: extrai o user_id diretamente da página pública do Threads
+    try {
+        const pageRes = await axios.get(`https://www.threads.net/@${encodeURIComponent(cleanUser)}`, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml'
+            },
+            timeout: 15000
+        });
+        const html = String(pageRes.data || '');
+        const match = html.match(/"user_id":"(\d+)"/) || html.match(/"props":\{"user_id":"(\d+)"/);
+        if (match && match[1]) {
+            threadsUserIdCache.set(cleanUser, match[1]);
+            return match[1];
+        }
+    } catch (e) {
+        // segue para retornar null
+    }
+
+    return null;
+}
+
 app.get('/api/latest-threads', async (req, res) => {
     const { username } = req.query;
     if (!username) {
@@ -539,13 +592,24 @@ app.get('/api/latest-threads', async (req, res) => {
         return res.status(500).json({ error: 'Variável RAPIDAPI_KEY não configurada.' });
     }
 
+    const headers = {
+        'x-rapidapi-key': apiKey,
+        'x-rapidapi-host': THREADS_RAPIDAPI_HOST
+    };
+
     try {
+        const userId = await resolveThreadsUserId(cleanUser, headers);
+        if (!userId) {
+            return res.status(404).json({ error: 'Não foi possível localizar o ID numérico deste perfil no Threads.' });
+        }
+
+        // Envia user_id e userId para cobrir ambas as convenções da API
         const response = await axios.get(`https://${THREADS_RAPIDAPI_HOST}/api/user/posts`, {
-            params: { username: cleanUser },
-            headers: {
-                'x-rapidapi-key': apiKey,
-                'x-rapidapi-host': THREADS_RAPIDAPI_HOST
+            params: {
+                user_id: userId,
+                userId: userId
             },
+            headers,
             timeout: 25000
         });
 
@@ -554,7 +618,7 @@ app.get('/api/latest-threads', async (req, res) => {
         if (!Array.isArray(threadsList) || threadsList.length === 0) {
             return res.status(404).json({
                 error: 'Nenhuma publicação encontrada no Threads.',
-                debug_keys: response.data && typeof response.data === 'object' ? Object.keys(response.data) : typeof response.data,
+                resolved_user_id: userId,
                 debug_sample: JSON.stringify(response.data).slice(0, 400)
             });
         }
@@ -604,7 +668,6 @@ app.get('/api/latest-threads', async (req, res) => {
         });
     }
 });
-
 // ==========================================
 // PROXY DE IMAGEM (/api/image-proxy)
 // ==========================================

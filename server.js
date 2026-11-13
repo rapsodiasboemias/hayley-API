@@ -369,6 +369,44 @@ app.get('/api/latest-tweet', async (req, res) => {
 // ==========================================
 // ROTA YOUTUBE (/api/latest-youtube) - 100% GRATUITA VIA RSS OFICIAL
 // ==========================================
+async function resolveYoutubeChannelId(input) {
+    let clean = input.trim().replace(/\/+$/, '');
+
+    const urlUcMatch = clean.match(/youtube\.com\/channel\/(UC[\w-]{22})/i);
+    if (urlUcMatch) return urlUcMatch[1];
+
+    const urlHandleMatch = clean.match(/youtube\.com\/(@[^/?#]+)/i);
+    if (urlHandleMatch) clean = urlHandleMatch[1];
+
+    if (/^UC[\w-]{22}$/.test(clean)) return clean;
+
+    const cachedId = youtubeIdCache.get(clean.toLowerCase());
+    if (cachedId) return cachedId;
+
+    const handle = clean.startsWith('@') ? clean : `@${clean}`;
+    const res = await axios.get(`https://www.youtube.com/${encodeURI(handle)}`, {
+        headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Cookie': 'CONSENT=YES+cb.20210328-17-p0.en+FX+999; SOCS=CAI'
+        },
+        timeout: 15000
+    });
+
+    const html = String(res.data || '');
+    const match = html.match(/"externalId"\s*:\s*"(UC[\w-]{22})"/)
+        || html.match(/"channelId"\s*:\s*"(UC[\w-]{22})"/)
+        || html.match(/"browseId"\s*:\s*"(UC[\w-]{22})"/)
+        || html.match(/itemprop="channelId"\s+content="(UC[\w-]{22})"/)
+        || html.match(/youtube\.com\/channel\/(UC[\w-]{22})/);
+
+    if (match && match[1]) {
+        youtubeIdCache.set(clean.toLowerCase(), match[1]);
+        return match[1];
+    }
+    return null;
+}
 
 app.get('/api/latest-youtube', async (req, res) => {
     const { channel } = req.query;
@@ -389,8 +427,14 @@ app.get('/api/latest-youtube', async (req, res) => {
         }
 
         const feedUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
-        const feedRes = await axios.get(feedUrl, { timeout: 15000 });
-        const xml = feedRes.data;
+        const feedRes = await axios.get(feedUrl, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                'Accept': 'application/xml,text/xml,*/*;q=0.8'
+            },
+            timeout: 15000
+        });
+        const xml = String(feedRes.data || '');
 
         const authorMatch = xml.match(/<author>\s*<name>([\s\S]*?)<\/name>/);
         const entryMatch = xml.match(/<entry>([\s\S]*?)<\/entry>/);
@@ -426,8 +470,12 @@ app.get('/api/latest-youtube', async (req, res) => {
         return res.json(resultData);
 
     } catch (error) {
-        console.error(`Erro YouTube (${channel}):`, error.message);
-        return res.status(500).json({ error: 'Falha ao carregar feed do YouTube.' });
+        console.error(`Erro YouTube (${channel}):`, error.response?.status, error.message);
+        return res.status(500).json({
+            error: 'Falha ao carregar feed do YouTube.',
+            status_code: error.response?.status || 500,
+            details: error.message
+        });
     }
 });
 

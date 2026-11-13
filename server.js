@@ -109,60 +109,6 @@ async function fetchTweetViaSyndication(cleanUser) {
     };
 }
 
-async function resolveYoutubeChannelId(input) {
-    let clean = input.trim().replace(/\/+$/, '');
-
-    const urlUcMatch = clean.match(/youtube\.com\/channel\/(UC[\w-]{22})/i);
-    if (urlUcMatch) return urlUcMatch[1];
-
-    const urlHandleMatch = clean.match(/youtube\.com\/(@[^/?#]+)/i);
-    if (urlHandleMatch) clean = urlHandleMatch[1];
-
-    const urlCustomMatch = clean.match(/youtube\.com\/(?:c|user)\/([^/?#]+)/i);
-    if (urlCustomMatch) clean = urlCustomMatch[1];
-
-    if (/^UC[\w-]{22}$/.test(clean)) return clean;
-
-    const cachedId = youtubeIdCache.get(clean.toLowerCase());
-    if (cachedId) return cachedId;
-
-    const bareName = clean.replace(/^@/, '');
-    const candidateUrls = [
-        `https://www.youtube.com/@${encodeURI(bareName)}`,
-        `https://www.youtube.com/c/${encodeURI(bareName)}`,
-        `https://www.youtube.com/user/${encodeURI(bareName)}`
-    ];
-
-    for (const pageUrl of candidateUrls) {
-        try {
-            const res = await axios.get(pageUrl, {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Cookie': 'CONSENT=YES+cb.20210328-17-p0.en+FX+999; SOCS=CAI'
-                },
-                timeout: 15000
-            });
-
-            const html = String(res.data || '');
-            const match = html.match(/"externalId"\s*:\s*"(UC[\w-]{22})"/)
-                || html.match(/"channelId"\s*:\s*"(UC[\w-]{22})"/)
-                || html.match(/"browseId"\s*:\s*"(UC[\w-]{22})"/)
-                || html.match(/itemprop="channelId"\s+content="(UC[\w-]{22})"/)
-                || html.match(/youtube\.com\/channel\/(UC[\w-]{22})/);
-
-            if (match && match[1]) {
-                youtubeIdCache.set(clean.toLowerCase(), match[1]);
-                return match[1];
-            }
-        } catch (e) {
-            // tenta o próximo formato de URL
-        }
-    }
-
-    return null;
-}
 function decodeXmlEntities(str) {
     if (!str) return '';
     return str
@@ -381,7 +327,7 @@ app.get('/api/latest-tweet', async (req, res) => {
 });
 
 // ==========================================
-// ROTA YOUTUBE (/api/latest-youtube) - 100% GRATUITA VIA RSS OFICIAL
+// ROTA YOUTUBE (/api/latest-youtube) - 100% GRATUITA
 // ==========================================
 
 function extractFirstVideoFromYtInitialData(html) {
@@ -788,7 +734,7 @@ app.get('/api/latest-threads', async (req, res) => {
             });
         }
 
-validPosts.sort((a, b) => (Number(b?.taken_at) || 0) - (Number(a?.taken_at) || 0));
+        validPosts.sort((a, b) => (Number(b?.taken_at) || 0) - (Number(a?.taken_at) || 0));
         const post = validPosts[0];
         const firstEntry = post?._rawEntry || post;
 
@@ -858,18 +804,6 @@ validPosts.sort((a, b) => (Number(b?.taken_at) || 0) - (Number(a?.taken_at) || 0
         const resultData = {
             username: finalUsername,
             text: captionText || (rawMedia ? '' : `See post by @${finalUsername} on Threads`),
-            media_url: rawMedia ? `${hostUrl}/api/image-proxy?url=${encodeURIComponent(rawMedia)}` : null,
-            permalink: postCode
-                ? `https://www.threads.net/@${finalUsername}/post/${postCode}`
-                : `https://www.threads.net/@${finalUsername}`
-        };
-
-        const hostUrl = `https://${req.get('host')}`;
-        const finalUsername = post?.user?.username || (/^\d+$/.test(cleanUser) ? 'threads' : cleanUser);
-
-        const resultData = {
-            username: finalUsername,
-            text: captionText || `Nova atualização de @${finalUsername} no Threads`,
             media_url: rawMedia ? `${hostUrl}/api/image-proxy?url=${encodeURIComponent(rawMedia)}` : null,
             permalink: postCode
                 ? `https://www.threads.net/@${finalUsername}/post/${postCode}`

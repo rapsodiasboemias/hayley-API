@@ -533,33 +533,67 @@ function findThreadsPosts(obj, depth = 0) {
 }
 
 async function resolveThreadsUserId(cleanUser, headers) {
+    // 0. Se o usuário já passou o ID numérico direto no Tumblr, retorna na hora
+    if (/^\d+$/.test(cleanUser)) {
+        return cleanUser;
+    }
+
     const cachedId = threadsUserIdCache.get(cleanUser);
     if (cachedId) return cachedId;
 
+    // 1. Tenta todos os endpoints de busca/perfil da threads-api4
     const profileEndpoints = [
+        { url: `https://${THREADS_RAPIDAPI_HOST}/api/user/detail`, params: { username: cleanUser } },
         { url: `https://${THREADS_RAPIDAPI_HOST}/api/user/info`, params: { username: cleanUser } },
-        { url: `https://${THREADS_RAPIDAPI_HOST}/api/user/profile`, params: { username: cleanUser } },
-        { url: `https://${THREADS_RAPIDAPI_HOST}/api/user/id`, params: { username: cleanUser } }
+        { url: `https://${THREADS_RAPIDAPI_HOST}/api/user/search`, params: { query: cleanUser, username: cleanUser } },
+        { url: `https://${THREADS_RAPIDAPI_HOST}/api/search/users`, params: { query: cleanUser } }
     ];
 
     for (const ep of profileEndpoints) {
         try {
             const res = await axios.get(ep.url, { params: ep.params, headers, timeout: 15000 });
-            const d = res.data || {};
-            const id = d.user_id || d.id || d.pk
-                || d.data?.user_id || d.data?.id || d.data?.pk
-                || d.data?.user?.id || d.data?.user?.pk
-                || d.user?.id || d.user?.pk;
+            const rawStr = JSON.stringify(res.data || {});
+            // Procura o ID associado ao username exato no JSON retornado
+            const userRegex = new RegExp(`"username"\\s*:\\s*"${cleanUser}"[^{}]{0,300}?"(?:pk|id|user_id)"\\s*:\\s*"?(\\d+)"?`, 'i');
+            const reverseRegex = new RegExp(`"(?:pk|id|user_id)"\\s*:\\s*"?(\\d+)"?[^{}]{0,300}?"username"\\s*:\\s*"${cleanUser}"`, 'i');
+            const m = rawStr.match(userRegex) || rawStr.match(reverseRegex);
 
-            if (id && /^\d+$/.test(String(id))) {
-                threadsUserIdCache.set(cleanUser, String(id));
-                return String(id);
+            if (m && m[1]) {
+                threadsUserIdCache.set(cleanUser, m[1]);
+                return m[1];
             }
         } catch (e) {
             // tenta próximo endpoint
         }
     }
 
+    // 2. Fallback via Instagram Looter2 (o ID numérico da conta Meta/Threads é o mesmo do Instagram)
+    try {
+        const igCachedId = userIdCache.get(cleanUser);
+        if (igCachedId) {
+            threadsUserIdCache.set(cleanUser, String(igCachedId));
+            return String(igCachedId);
+        }
+
+        const igRes = await axios.get(`https://${IG_RAPIDAPI_HOST}/profile`, {
+            params: { username: cleanUser },
+            headers: {
+                'x-rapidapi-key': headers['x-rapidapi-key'],
+                'x-rapidapi-host': IG_RAPIDAPI_HOST
+            },
+            timeout: 15000
+        });
+        const igId = igRes.data?.id || igRes.data?.user?.id;
+        if (igId && /^\d+$/.test(String(igId))) {
+            userIdCache.set(cleanUser, String(igId));
+            threadsUserIdCache.set(cleanUser, String(igId));
+            return String(igId);
+        }
+    } catch (e) {
+        // segue para o fallback HTML
+    }
+
+    // 3. Fallback HTML público do Threads
     try {
         const pageRes = await axios.get(`https://www.threads.net/@${encodeURIComponent(cleanUser)}`, {
             headers: {

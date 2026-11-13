@@ -333,57 +333,138 @@ app.get('/api/latest-tweet', async (req, res) => {
 app.get('/api/latest-youtube', async (req, res) => {
     const { channel } = req.query;
     if (!channel) {
-        return res.status(400).json({ error: 'Parâmetro channel (ID UC...) é obrigatório.' });
+        return res.status(400).json({ error: 'Parâmetro channel (ID UC... ou @handle) é obrigatório.' });
     }
 
-    const ucMatch = channel.trim().match(/(UC[\w-]{22})/);
-    if (!ucMatch) {
-        return res.status(400).json({ error: 'Informe um ID de canal válido começando com UC.' });
-    }
-
-    const channelId = ucMatch[1];
-    const cached = youtubeCache.get(channelId);
+    const rawInput = channel.trim();
+    const cacheKey = rawInput.toLowerCase();
+    const cached = youtubeCache.get(cacheKey);
     if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
         return res.json(cached.data);
     }
 
+    const webHeaders = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+        'Cookie': 'CONSENT=YES+cb.20210328-17-p0.en+FX+999; SOCS=CAI'
+    };
+
     try {
-        const feedUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
-        const feedRes = await axios.get(feedUrl, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (compatible; FeedReader/1.0)',
-                'Accept': 'application/atom+xml,application/xml,text/xml,*/*;q=0.8'
-            },
-            timeout: 15000
-        });
+        let channelId = null;
+        let channelUrlForScrape = null;
+        const ucMatch = rawInput.match(/(UC[\w-]{22})/);
 
-        const xml = String(feedRes.data || '');
-        const authorMatch = xml.match(/<author>\s*<name>([\s\S]*?)<\/name>/);
-        const entryMatch = xml.match(/<entry>([\s\S]*?)<\/entry>/);
-        const videoIdMatch = entryMatch?.[1]?.match(/<yt:videoId>([\s\S]*?)<\/yt:videoId>/);
-        const titleMatch = entryMatch?.[1]?.match(/<title>([\s\S]*?)<\/title>/);
+        if (ucMatch) {
+            channelId = ucMatch[1];
+            channelUrlForScrape = `https://www.youtube.com/channel/${channelId}/videos`;
+        } else {
+            const handleMatch = rawInput.match(/@([\w.-]+)/);
+            const handle = handleMatch ? `@${handleMatch[1]}` : (rawInput.startsWith('@') ? rawInput : `@${rawInput}`);
+            channelUrlForScrape = `https://www.youtube.com/${encodeURI(handle)}/videos`;
 
-        if (!videoIdMatch) {
-            return res.status(404).json({ error: 'Nenhum vídeo encontrado no feed RSS.' });
+            const pageRes = await axios.get(channelUrlForScrape, { headers: webHeaders, timeout: 15000 });
+            const html = String(pageRes.data || '');
+            const idInHtml = html.match(/"externalId":"(UC[\w-]{22})"/)
+                || html.match(/"channelId":"(UC[\w-]{22})"/)
+                || html.match(/channel_id=(UC[\w-]{22})/);
+            if (idInHtml) {
+                channelId = idInHtml[1];
+            }
         }
 
-        const videoId = videoIdMatch[1].trim();
-        const resultData = {
-            channel_id: channelId,
-            channel_name: authorMatch ? decodeXmlEntities(authorMatch[1].trim()) : channelId,
-            video_id: videoId,
-            title: titleMatch ? decodeXmlEntities(titleMatch[1].trim()) : 'Watch on YouTube',
-            thumbnail_url: `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
-            permalink: `https://www.youtube.com/watch?v=${videoId}`
-        };
+        // 1. Tenta o Feed RSS da playlist automática de uploads (UC... -> UU...) e do canal
+        if (channelId) {
+            const uploadsPlaylistId = 'UU' + channelId.slice(2);
+            const rssCandidates = [
+                `https://www.youtube.com/feeds/videos.xml?playlist_id=${uploadsPlaylistId}`,
+                `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`
+            ];
 
-        youtubeCache.set(channelId, { timestamp: Date.now(), data: resultData });
-        return res.json(resultData);
+            for (const feedUrl of rssCandidates) {
+                try {
+                    const feedRes = await axios.get(feedUrl, {
+                        headers: {
+                            'User-Agent': 'Mozilla/5.0 (compatible; FeedReader/1.0)',
+                            'Accept': 'application/atom+xml,application/xml,text/xml,*/*;q=0.8'
+                        },
+                        timeout: 12000
+                    });
+
+                    const xml = String(feedRes.data || '');
+                    const authorMatch = xml.match(/<author>\s*<name>([\s\S]*?)<\/name>/);
+                    const entryMatch = xml.match(/<entry>([\s\S]*?)<\/entry>/);
+                    const videoIdMatch = entryMatch?.[1]?.match(/<yt:videoId>([\s\S]*?)<\/yt:videoId>/);
+                    const titleMatch = entryMatch?.[1]?.match(/<title>([\s\S]*?)<\/title>/);
+
+                    if (videoIdMatch) {
+                        const videoId = videoIdMatch[1].trim();
+                        const resultData = {
+                            channel_id: channelId,
+                            channel_name: authorMatch ? decodeXmlEntities(authorMatch[1].trim()) : channelId,
+                            video_id: videoId,
+                            title: titleMatch ? decodeXmlEntities(titleMatch[1].trim()) : 'Watch on YouTube',
+                            thumbnail_url: `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
+                            permalink: `https://www.youtube.com/watch?v=${videoId}`
+                        };
+
+                        youtubeCache.set(cacheKey, { timestamp: Date.now(), data: resultData });
+                        return res.json(resultData);
+                    }
+                } catch (rssErr) {
+                    // segue para o próximo feed ou para o fallback HTML
+                }
+            }
+        }
+
+        // 2. Fallback: lê o JSON ytInitialData direto da aba /videos do canal
+        if (channelUrlForScrape) {
+            const videosRes = await axios.get(channelUrlForScrape, { headers: webHeaders, timeout: 15000 });
+            const html = String(videosRes.data || '');
+            const jsonMatch = html.match(/var ytInitialData\s*=\s*(\{[\s\S]*?\});\s*<\/script>/);
+
+            if (jsonMatch) {
+                const ytData = JSON.parse(jsonMatch[1]);
+                const channelName = ytData?.metadata?.channelMetadataRenderer?.title || channelId || rawInput;
+                const tabs = ytData?.contents?.twoColumnBrowseResultsRenderer?.tabs || [];
+                const videosTab = tabs.find(t => t?.tabRenderer?.selected) || tabs[1] || tabs[0];
+                const contents = videosTab?.tabRenderer?.content?.richGridRenderer?.contents || [];
+
+                let videoRenderer = null;
+                for (const item of contents) {
+                    const vr = item?.richItemRenderer?.content?.videoRenderer;
+                    if (vr && vr.videoId) {
+                        videoRenderer = vr;
+                        break;
+                    }
+                }
+
+                if (videoRenderer) {
+                    const videoId = videoRenderer.videoId;
+                    const title = videoRenderer.title?.runs?.[0]?.text
+                        || videoRenderer.title?.simpleText
+                        || 'Watch on YouTube';
+
+                    const resultData = {
+                        channel_id: channelId || '',
+                        channel_name: channelName,
+                        video_id: videoId,
+                        title: title,
+                        thumbnail_url: `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
+                        permalink: `https://www.youtube.com/watch?v=${videoId}`
+                    };
+
+                    youtubeCache.set(cacheKey, { timestamp: Date.now(), data: resultData });
+                    return res.json(resultData);
+                }
+            }
+        }
+
+        return res.status(404).json({ error: 'Nenhum vídeo encontrado para este canal do YouTube.' });
 
     } catch (error) {
-        console.error(`Erro RSS YouTube (${channelId}):`, error.response?.status, error.message);
-        return res.status(500).json({
-            error: 'Falha ao ler RSS do YouTube.',
+        console.error(`Erro YouTube (${rawInput}):`, error.response?.status, error.message);
+        return res.status(error.response?.status || 500).json({
+            error: 'Falha ao carregar vídeos do YouTube.',
             status_code: error.response?.status || 500
         });
     }

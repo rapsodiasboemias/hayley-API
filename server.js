@@ -10,7 +10,6 @@ const TWITTER_RAPIDAPI_HOST = 'twitter-api45.p.rapidapi.com';
 const TIKTOK_RAPIDAPI_HOST = 'tiktok-scraper7.p.rapidapi.com';
 const THREADS_RAPIDAPI_HOST = 'threads-api4.p.rapidapi.com';
 
-// Cache de 12 horas para economizar requisições na cota gratuita
 const postsCache = new Map();
 const userIdCache = new Map();
 const tweetsCache = new Map();
@@ -18,6 +17,8 @@ const youtubeCache = new Map();
 const youtubeIdCache = new Map();
 const tiktokCache = new Map();
 const threadsCache = new Map();
+const threadsUserIdCache = new Map();
+
 const CACHE_TTL = 12 * 60 * 60 * 1000;       // 12h para YouTube e Twitter/X (URLs permanentes)
 const SHORT_CACHE_TTL = 2 * 60 * 60 * 1000;  // 2h para Instagram, Threads e TikTok (CDNs que expiram)
 
@@ -157,6 +158,9 @@ app.get('/api/latest-post', async (req, res) => {
 
     const cachedPost = postsCache.get(cleanUser);
     if (cachedPost && (Date.now() - cachedPost.timestamp < SHORT_CACHE_TTL)) {
+        return res.json(cachedPost.data);
+    }
+
     const apiKey = process.env.RAPIDAPI_KEY;
     if (!apiKey) {
         return res.status(500).json({ error: 'Variável RAPIDAPI_KEY não configurada na Render.' });
@@ -427,6 +431,9 @@ app.get('/api/latest-tiktok', async (req, res) => {
     const cleanUser = username.trim().toLowerCase().replace(/^@/, '');
     const cached = tiktokCache.get(cleanUser);
     if (cached && (Date.now() - cached.timestamp < SHORT_CACHE_TTL)) {
+        return res.json(cached.data);
+    }
+
     const apiKey = process.env.RAPIDAPI_KEY;
     if (!apiKey) {
         return res.status(500).json({ error: 'Variável RAPIDAPI_KEY não configurada.' });
@@ -479,8 +486,6 @@ app.get('/api/latest-tiktok', async (req, res) => {
 // ROTA THREADS (/api/latest-threads) - VIA RAPIDAPI (threads-api4)
 // ==========================================
 
-const threadsUserIdCache = new Map();
-
 function findThreadsPosts(obj, depth = 0) {
     if (!obj || typeof obj !== 'object' || depth > 6) return [];
 
@@ -529,7 +534,6 @@ async function resolveThreadsUserId(cleanUser, headers) {
     const cachedId = threadsUserIdCache.get(cleanUser);
     if (cachedId) return cachedId;
 
-    // 1. Tenta via endpoint de perfil da threads-api4
     const profileEndpoints = [
         { url: `https://${THREADS_RAPIDAPI_HOST}/api/user/info`, params: { username: cleanUser } },
         { url: `https://${THREADS_RAPIDAPI_HOST}/api/user/profile`, params: { username: cleanUser } },
@@ -554,7 +558,6 @@ async function resolveThreadsUserId(cleanUser, headers) {
         }
     }
 
-    // 2. Fallback gratuito: extrai o user_id diretamente da página pública do Threads
     try {
         const pageRes = await axios.get(`https://www.threads.net/@${encodeURIComponent(cleanUser)}`, {
             headers: {
@@ -585,6 +588,9 @@ app.get('/api/latest-threads', async (req, res) => {
     const cleanUser = username.trim().toLowerCase().replace(/^@/, '');
     const cached = threadsCache.get(cleanUser);
     if (cached && (Date.now() - cached.timestamp < SHORT_CACHE_TTL)) {
+        return res.json(cached.data);
+    }
+
     const apiKey = process.env.RAPIDAPI_KEY;
     if (!apiKey) {
         return res.status(500).json({ error: 'Variável RAPIDAPI_KEY não configurada.' });
@@ -601,7 +607,6 @@ app.get('/api/latest-threads', async (req, res) => {
             return res.status(404).json({ error: 'Não foi possível localizar o ID numérico deste perfil no Threads.' });
         }
 
-        // Envia user_id e userId para cobrir ambas as convenções da API
         const response = await axios.get(`https://${THREADS_RAPIDAPI_HOST}/api/user/posts`, {
             params: {
                 user_id: userId,
@@ -666,6 +671,7 @@ app.get('/api/latest-threads', async (req, res) => {
         });
     }
 });
+
 // ==========================================
 // PROXY DE IMAGEM (/api/image-proxy)
 // ==========================================
@@ -696,7 +702,7 @@ app.get('/api/image-proxy', async (req, res) => {
         });
 
         res.setHeader('Content-Type', response.headers['content-type'] || 'image/jpeg');
-        res.setHeader('Cache-Control', 'public, max-age=86400');
+        res.setHeader('Cache-Control', 'public, max-age=3600');
         response.data.pipe(res);
     } catch (err) {
         console.error('Erro no image-proxy:', url, err.message);

@@ -484,141 +484,6 @@ app.get('/api/latest-tiktok', async (req, res) => {
     }
 });
 
-// ==========================================
-// ROTA THREADS (/api/latest-threads) - VIA RAPIDAPI (threads21)
-// ==========================================
-
-function findThreadsPosts(obj, depth = 0) {
-    if (!obj || typeof obj !== 'object' || depth > 6) return [];
-
-    if (Array.isArray(obj)) {
-        for (const item of obj) {
-            if (item && (item.thread_items || item.post || item.caption || item.text_post_app_info || item.node)) {
-                return obj;
-            }
-        }
-        for (const item of obj) {
-            const found = findThreadsPosts(item, depth + 1);
-            if (found.length > 0) return found;
-        }
-        return [];
-    }
-
-    const directCandidates = [
-        obj.threads,
-        obj.posts,
-        obj.items,
-        obj.results,
-        obj.edges,
-        obj.mediaData?.threads,
-        obj.data?.mediaData?.threads,
-        obj.data?.threads,
-        obj.data?.posts,
-        obj.data?.items,
-        obj.data?.edges,
-        obj.data?.user?.threads
-    ];
-
-    for (const candidate of directCandidates) {
-        if (Array.isArray(candidate) && candidate.length > 0) {
-            return candidate;
-        }
-    }
-
-    for (const key of Object.keys(obj)) {
-        const found = findThreadsPosts(obj[key], depth + 1);
-        if (found.length > 0) return found;
-    }
-
-    return [];
-}
-
-async function resolveThreadsUserId(cleanUser, headers) {
-    // 0. Se já for numérico, retorna direto
-    if (/^\d+$/.test(cleanUser)) {
-        return cleanUser;
-    }
-
-    const cachedId = threadsUserIdCache.get(cleanUser);
-    if (cachedId) return cachedId;
-
-    // 1. Busca pelo endpoint Search da threads21 (inclusive buscando sem "_" caso a busca quebre com underscore)
-    const searchTerms = [cleanUser];
-    if (cleanUser.includes('_')) {
-        searchTerms.push(cleanUser.replace(/_/g, ' '));
-    }
-
-    for (const term of searchTerms) {
-        const searchAttempts = [
-            { url: `https://${THREADS_RAPIDAPI_HOST}/api/search`, params: { query: term, type: 'users' } },
-            { url: `https://${THREADS_RAPIDAPI_HOST}/api/search`, params: { q: term } },
-            { url: `https://${THREADS_RAPIDAPI_HOST}/api/search`, params: { query: term } }
-        ];
-
-        for (const attempt of searchAttempts) {
-            try {
-                const res = await axios.get(attempt.url, {
-                    params: attempt.params,
-                    headers,
-                    timeout: 15000
-                });
-                const rawStr = JSON.stringify(res.data || {});
-                const escapedUser = cleanUser.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-                // Busca o ID numérico vinculado ao username exato (com ou sem aspas no número, com janela ampla)
-                const userRegex = new RegExp(`"username"\\s*:\\s*"${escapedUser}"[\\s\\S]{0,1200}?"(?:pk|id|user_id)"\\s*:\\s*"?(\\d+)"?`, 'i');
-                const reverseRegex = new RegExp(`"(?:pk|id|user_id)"\\s*:\\s*"?(\\d+)"?[\\s\\S]{0,1200}?"username"\\s*:\\s*"${escapedUser}"`, 'i');
-                const m = rawStr.match(userRegex) || rawStr.match(reverseRegex);
-
-                if (m && m[1]) {
-                    threadsUserIdCache.set(cleanUser, m[1]);
-                    return m[1];
-                }
-            } catch (e) {
-                // tenta o próximo formato
-            }
-        }
-    }
-
-    // 2. Fallback via HTML público do Threads (threads.net e threads.com) com múltiplos padrões de ID
-    const publicUrls = [
-        `https://www.threads.net/@${encodeURIComponent(cleanUser)}`,
-        `https://www.threads.com/@${encodeURIComponent(cleanUser)}`
-    ];
-
-    for (const pageUrl of publicUrls) {
-        try {
-            const pageRes = await axios.get(pageUrl, {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Sec-Fetch-Site': 'none',
-                    'Sec-Fetch-Mode': 'navigate'
-                },
-                timeout: 15000
-            });
-            const html = String(pageRes.data || '');
-            const escapedUser = cleanUser.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-            const match = html.match(/"user_id"\s*:\s*"(\d+)"/)
-                || html.match(/"props"\s*:\s*\{"user_id"\s*:\s*"(\d+)"/)
-                || html.match(new RegExp(`"pk"\\s*:\\s*"(\\d+)"[\\s\\S]{0,300}?"username"\\s*:\\s*"${escapedUser}"`, 'i'))
-                || html.match(new RegExp(`"username"\\s*:\\s*"${escapedUser}"[\\s\\S]{0,300}?"pk"\\s*:\\s*"(\\d+)"`, 'i'))
-                || html.match(/threads:\/\/user\?id=(\d+)/i);
-
-            if (match && match[1]) {
-                threadsUserIdCache.set(cleanUser, match[1]);
-                return match[1];
-            }
-        } catch (e) {
-            // tenta próxima URL
-        }
-    }
-
-    return null;
-}
-
 app.get('/api/latest-threads', async (req, res) => {
     const { username } = req.query;
     if (!username) {
@@ -647,19 +512,38 @@ app.get('/api/latest-threads', async (req, res) => {
             return res.status(404).json({ error: 'Não foi possível localizar o ID numérico deste perfil no Threads.' });
         }
 
-        const response = await axios.get(`https://${THREADS_RAPIDAPI_HOST}/api/users/${encodeURIComponent(userId)}/posts`, {
-            params: { first: 10 },
-            headers,
-            timeout: 25000
-        });
+        const postEndpoints = [
+            { url: `https://${THREADS_RAPIDAPI_HOST}/api/users/${encodeURIComponent(userId)}/posts`, params: { first: 10 } },
+            { url: `https://${THREADS_RAPIDAPI_HOST}/api/users/${encodeURIComponent(userId)}/media`, params: { first: 10 } },
+            { url: `https://${THREADS_RAPIDAPI_HOST}/api/users/${encodeURIComponent(userId)}/reposts`, params: { first: 10 } }
+        ];
 
-        const threadsList = findThreadsPosts(response.data);
+        let threadsList = [];
+        let lastDebugSample = '';
+
+        for (const ep of postEndpoints) {
+            try {
+                const response = await axios.get(ep.url, {
+                    params: ep.params,
+                    headers,
+                    timeout: 25000
+                });
+                lastDebugSample = JSON.stringify(response.data).slice(0, 400);
+                const found = findThreadsPosts(response.data);
+                if (Array.isArray(found) && found.length > 0) {
+                    threadsList = found;
+                    break;
+                }
+            } catch (e) {
+                lastDebugSample = e.message;
+            }
+        }
 
         if (!Array.isArray(threadsList) || threadsList.length === 0) {
             return res.status(404).json({
                 error: 'Nenhuma publicação encontrada no Threads.',
                 resolved_user_id: userId,
-                debug_sample: JSON.stringify(response.data).slice(0, 400)
+                debug_sample: lastDebugSample
             });
         }
 

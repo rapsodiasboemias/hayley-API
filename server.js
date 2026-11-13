@@ -635,6 +635,121 @@ app.get('/api/image-proxy', async (req, res) => {
 // ROTA THREADS (/api/latest-threads) - VIA RAPIDAPI (threads21)
 // ==========================================
 
+function findThreadsPosts(obj, depth = 0) {
+    if (!obj || typeof obj !== 'object' || depth > 6) return [];
+
+    if (Array.isArray(obj)) {
+        for (const item of obj) {
+            if (item && (item.thread_items || item.post || item.caption || item.text_post_app_info || item.node)) {
+                return obj;
+            }
+        }
+        for (const item of obj) {
+            const found = findThreadsPosts(item, depth + 1);
+            if (found.length > 0) return found;
+        }
+        return [];
+    }
+
+    const directCandidates = [
+        obj.threads,
+        obj.posts,
+        obj.items,
+        obj.results,
+        obj.edges,
+        obj.mediaData?.threads,
+        obj.data?.mediaData?.threads,
+        obj.data?.threads,
+        obj.data?.posts,
+        obj.data?.items,
+        obj.data?.edges,
+        obj.data?.user?.threads
+    ];
+
+    for (const candidate of directCandidates) {
+        if (Array.isArray(candidate) && candidate.length > 0) {
+            return candidate;
+        }
+    }
+
+    for (const key of Object.keys(obj)) {
+        const found = findThreadsPosts(obj[key], depth + 1);
+        if (found.length > 0) return found;
+    }
+
+    return [];
+}
+
+async function resolveThreadsUserId(cleanUser, headers) {
+    if (/^\d+$/.test(cleanUser)) {
+        return cleanUser;
+    }
+
+    const cachedId = threadsUserIdCache.get(cleanUser);
+    if (cachedId) return cachedId;
+
+    const escapedUser = cleanUser.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    // 1. Tenta primeiro o HTML público do Threads (custo 0 na RapidAPI)
+    const publicUrls = [
+        `https://www.threads.net/@${encodeURIComponent(cleanUser)}`,
+        `https://www.threads.com/@${encodeURIComponent(cleanUser)}`
+    ];
+
+    for (const pageUrl of publicUrls) {
+        try {
+            const pageRes = await axios.get(pageUrl, {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9'
+                },
+                timeout: 12000
+            });
+            const html = String(pageRes.data || '');
+
+            const match = html.match(/"user_id"\s*:\s*"(\d+)"/)
+                || html.match(/"props"\s*:\s*\{"user_id"\s*:\s*"(\d+)"/)
+                || html.match(new RegExp(`"pk"\\s*:\\s*"(\\d+)"[\\s\\S]{0,300}?"username"\\s*:\\s*"${escapedUser}"`, 'i'))
+                || html.match(new RegExp(`"username"\\s*:\\s*"${escapedUser}"[\\s\\S]{0,300}?"pk"\\s*:\\s*"(\\d+)"`, 'i'))
+                || html.match(/threads:\/\/user\?id=(\d+)/i);
+
+            if (match && match[1]) {
+                threadsUserIdCache.set(cleanUser, match[1]);
+                return match[1];
+            }
+        } catch (e) {
+            // segue para a busca da API
+        }
+    }
+
+    // 2. Busca pelo endpoint Search da threads21
+    const modesToTry = ['profiles', 'users', 'top'];
+    for (const mode of modesToTry) {
+        try {
+            const res = await axios.get(`https://${THREADS_RAPIDAPI_HOST}/api/search`, {
+                params: { q: cleanUser, mode: mode, first: 10 },
+                headers,
+                timeout: 15000
+            });
+            const rawStr = JSON.stringify(res.data || {});
+
+            const userRegex = new RegExp(`"username"\\s*:\\s*"${escapedUser}"[\\s\\S]{0,1200}?"(?:pk|id|user_id)"\\s*:\\s*"?(\\d+)"?`, 'i');
+            const reverseRegex = new RegExp(`"(?:pk|id|user_id)"\\s*:\\s*"?(\\d+)"?[\\s\\S]{0,1200}?"username"\\s*:\\s*"${escapedUser}"`, 'i');
+            const m = rawStr.match(userRegex) || rawStr.match(reverseRegex);
+
+            if (m && m[1]) {
+                threadsUserIdCache.set(cleanUser, m[1]);
+                return m[1];
+            }
+        } catch (e) {
+            // tenta próximo mode
+        }
+    }
+
+    return null;
+}
+
 app.get('/api/latest-threads', async (req, res) => {
     const { username } = req.query;
     if (!username) {
@@ -668,7 +783,6 @@ app.get('/api/latest-threads', async (req, res) => {
                 { url: `https://${THREADS_RAPIDAPI_HOST}/api/users/${encodeURIComponent(userId)}/reposts`, params: { first: 10 }, isSearch: false }
             );
         }
-        // Fallback via busca recente (funciona até sem userId e para contas não verificadas)
         postEndpoints.push(
             { url: `https://${THREADS_RAPIDAPI_HOST}/api/search`, params: { q: cleanUser, mode: 'recent', first: 20 }, isSearch: true },
             { url: `https://${THREADS_RAPIDAPI_HOST}/api/search`, params: { q: cleanUser, mode: 'top', first: 20 }, isSearch: true }
@@ -693,7 +807,6 @@ app.get('/api/latest-threads', async (req, res) => {
                         return item?.thread_items?.[0]?.post || item?.post || item;
                     }).filter(Boolean);
 
-                    // Se veio da busca geral, filtra apenas posts cujo autor seja exatamente o cleanUser
                     const authoredPosts = ep.isSearch
                         ? extracted.filter((p) => (p?.user?.username || '').toLowerCase() === cleanUser)
                         : extracted;
@@ -716,7 +829,6 @@ app.get('/api/latest-threads', async (req, res) => {
             });
         }
 
-        // Ordena pelo timestamp (taken_at) decrescente para garantir o post MAIS RECENTE
         validPosts.sort((a, b) => (Number(b?.taken_at) || 0) - (Number(a?.taken_at) || 0));
         const post = validPosts[0];
 

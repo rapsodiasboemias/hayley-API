@@ -19,8 +19,8 @@ const tiktokCache = new Map();
 const threadsCache = new Map();
 const threadsUserIdCache = new Map();
 
-const CACHE_TTL = 12 * 60 * 60 * 1000;       // 12h para YouTube e Twitter/X (URLs permanentes)
-const SHORT_CACHE_TTL = 2 * 60 * 60 * 1000;  // 2h para Instagram, Threads e TikTok (CDNs que expiram)
+const CACHE_TTL = 12 * 60 * 60 * 1000;       // 12h para YouTube e Twitter/X
+const SHORT_CACHE_TTL = 2 * 60 * 60 * 1000;  // 2h para Instagram, Threads e TikTok
 
 setInterval(() => {
     const now = Date.now();
@@ -484,6 +484,121 @@ app.get('/api/latest-tiktok', async (req, res) => {
     }
 });
 
+// ==========================================
+// ROTA THREADS (/api/latest-threads) - VIA RAPIDAPI (threads21)
+// ==========================================
+
+function findThreadsPosts(obj, depth = 0) {
+    if (!obj || typeof obj !== 'object' || depth > 6) return [];
+
+    if (Array.isArray(obj)) {
+        for (const item of obj) {
+            if (item && (item.thread_items || item.post || item.caption || item.text_post_app_info || item.node)) {
+                return obj;
+            }
+        }
+        for (const item of obj) {
+            const found = findThreadsPosts(item, depth + 1);
+            if (found.length > 0) return found;
+        }
+        return [];
+    }
+
+    const directCandidates = [
+        obj.threads,
+        obj.posts,
+        obj.items,
+        obj.results,
+        obj.edges,
+        obj.mediaData?.threads,
+        obj.data?.mediaData?.threads,
+        obj.data?.threads,
+        obj.data?.posts,
+        obj.data?.items,
+        obj.data?.edges,
+        obj.data?.user?.threads
+    ];
+
+    for (const candidate of directCandidates) {
+        if (Array.isArray(candidate) && candidate.length > 0) {
+            return candidate;
+        }
+    }
+
+    for (const key of Object.keys(obj)) {
+        const found = findThreadsPosts(obj[key], depth + 1);
+        if (found.length > 0) return found;
+    }
+
+    return [];
+}
+
+async function resolveThreadsUserId(cleanUser, headers) {
+    if (/^\d+$/.test(cleanUser)) {
+        return cleanUser;
+    }
+
+    const cachedId = threadsUserIdCache.get(cleanUser);
+    if (cachedId) return cachedId;
+
+    const escapedUser = cleanUser.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    // 1. HTML público do Threads (custo 0)
+    const publicUrls = [
+        `https://www.threads.net/@${encodeURIComponent(cleanUser)}`,
+        `https://www.threads.com/@${encodeURIComponent(cleanUser)}`
+    ];
+
+    for (const pageUrl of publicUrls) {
+        try {
+            const pageRes = await axios.get(pageUrl, {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9'
+                },
+                timeout: 12000
+            });
+            const html = String(pageRes.data || '');
+
+            const match = html.match(/"user_id"\s*:\s*"(\d+)"/)
+                || html.match(/"props"\s*:\s*\{"user_id"\s*:\s*"(\d+)"/)
+                || html.match(new RegExp(`"pk"\\s*:\\s*"(\\d+)"[^{}]*?"username"\\s*:\\s*"${escapedUser}"`, 'i'))
+                || html.match(new RegExp(`"username"\\s*:\\s*"${escapedUser}"[^{}]*?"pk"\\s*:\\s*"(\\d+)"`, 'i'));
+
+            if (match && match[1]) {
+                threadsUserIdCache.set(cleanUser, match[1]);
+                return match[1];
+            }
+        } catch (e) {
+            // segue para busca da API
+        }
+    }
+
+    // 2. Busca estrita no mesmo objeto JSON do usuário
+    try {
+        const res = await axios.get(`https://${THREADS_RAPIDAPI_HOST}/api/search`, {
+            params: { q: cleanUser, mode: 'profiles', first: 10 },
+            headers,
+            timeout: 15000
+        });
+        const rawStr = JSON.stringify(res.data || {});
+
+        const strictUserRegex = new RegExp(`"username"\\s*:\\s*"${escapedUser}"[^{}]*?"(?:pk|id|user_id)"\\s*:\\s*"?(\\d+)"?`, 'i');
+        const strictReverseRegex = new RegExp(`"(?:pk|id|user_id)"\\s*:\\s*"?(\\d+)"?[^{}]*?"username"\\s*:\\s*"${escapedUser}"`, 'i');
+        const m = rawStr.match(strictUserRegex) || rawStr.match(strictReverseRegex);
+
+        if (m && m[1]) {
+            threadsUserIdCache.set(cleanUser, m[1]);
+            return m[1];
+        }
+    } catch (e) {
+        // segue para retornar null
+    }
+
+    return null;
+}
+
 app.get('/api/latest-threads', async (req, res) => {
     const { username } = req.query;
     if (!username) {
@@ -508,17 +623,21 @@ app.get('/api/latest-threads', async (req, res) => {
 
     try {
         const userId = await resolveThreadsUserId(cleanUser, headers);
-        if (!userId) {
-            return res.status(404).json({ error: 'Não foi possível localizar o ID numérico deste perfil no Threads.' });
+
+        const postEndpoints = [];
+        if (userId) {
+            postEndpoints.push(
+                { url: `https://${THREADS_RAPIDAPI_HOST}/api/users/${encodeURIComponent(userId)}/posts`, params: { first: 10 }, isSearch: false },
+                { url: `https://${THREADS_RAPIDAPI_HOST}/api/users/${encodeURIComponent(userId)}/media`, params: { first: 10 }, isSearch: false },
+                { url: `https://${THREADS_RAPIDAPI_HOST}/api/users/${encodeURIComponent(userId)}/reposts`, params: { first: 10 }, isSearch: false }
+            );
         }
+        postEndpoints.push(
+            { url: `https://${THREADS_RAPIDAPI_HOST}/api/search`, params: { q: cleanUser, mode: 'recent', first: 20 }, isSearch: true },
+            { url: `https://${THREADS_RAPIDAPI_HOST}/api/search`, params: { q: cleanUser, mode: 'top', first: 20 }, isSearch: true }
+        );
 
-        const postEndpoints = [
-            { url: `https://${THREADS_RAPIDAPI_HOST}/api/users/${encodeURIComponent(userId)}/posts`, params: { first: 10 } },
-            { url: `https://${THREADS_RAPIDAPI_HOST}/api/users/${encodeURIComponent(userId)}/media`, params: { first: 10 } },
-            { url: `https://${THREADS_RAPIDAPI_HOST}/api/users/${encodeURIComponent(userId)}/reposts`, params: { first: 10 } }
-        ];
-
-        let threadsList = [];
+        let validPosts = [];
         let lastDebugSample = '';
 
         for (const ep of postEndpoints) {
@@ -530,27 +649,47 @@ app.get('/api/latest-threads', async (req, res) => {
                 });
                 lastDebugSample = JSON.stringify(response.data).slice(0, 400);
                 const found = findThreadsPosts(response.data);
+
                 if (Array.isArray(found) && found.length > 0) {
-                    threadsList = found;
-                    break;
+                    const extracted = found.map((entry) => {
+                        const item = entry?.node || entry;
+                        return item?.thread_items?.[0]?.post || item?.post || item;
+                    }).filter(Boolean);
+
+                    if (!ep.isSearch) {
+                        if (extracted.length > 0) {
+                            validPosts = extracted;
+                            break;
+                        }
+                    } else {
+                        const authoredPosts = extracted.filter((p) => {
+                            const u = (p?.user?.username || p?.owner?.username || '').toLowerCase();
+                            return u === cleanUser;
+                        });
+
+                        if (authoredPosts.length > 0) {
+                            validPosts = authoredPosts;
+                            break;
+                        } else if (extracted.length > 0 && validPosts.length === 0) {
+                            validPosts = extracted;
+                        }
+                    }
                 }
             } catch (e) {
                 lastDebugSample = e.message;
             }
         }
 
-        if (!Array.isArray(threadsList) || threadsList.length === 0) {
+        if (validPosts.length === 0) {
             return res.status(404).json({
                 error: 'Nenhuma publicação encontrada no Threads.',
-                resolved_user_id: userId,
+                resolved_user_id: userId || null,
                 debug_sample: lastDebugSample
             });
         }
 
-        const firstEntry = threadsList[0]?.node || threadsList[0];
-        const post = firstEntry?.thread_items?.[0]?.post
-            || firstEntry?.post
-            || firstEntry;
+        validPosts.sort((a, b) => (Number(b?.taken_at) || 0) - (Number(a?.taken_at) || 0));
+        const post = validPosts[0];
 
         const captionText = typeof post?.caption === 'string'
             ? post.caption
@@ -628,248 +767,6 @@ app.get('/api/image-proxy', async (req, res) => {
     } catch (err) {
         console.error('Erro no image-proxy:', url, err.message);
         res.status(500).send('Erro ao carregar imagem');
-    }
-});
-
-// ==========================================
-// ROTA THREADS (/api/latest-threads) - VIA RAPIDAPI (threads21)
-// ==========================================
-
-function findThreadsPosts(obj, depth = 0) {
-    if (!obj || typeof obj !== 'object' || depth > 6) return [];
-
-    if (Array.isArray(obj)) {
-        for (const item of obj) {
-            if (item && (item.thread_items || item.post || item.caption || item.text_post_app_info || item.node)) {
-                return obj;
-            }
-        }
-        for (const item of obj) {
-            const found = findThreadsPosts(item, depth + 1);
-            if (found.length > 0) return found;
-        }
-        return [];
-    }
-
-    const directCandidates = [
-        obj.threads,
-        obj.posts,
-        obj.items,
-        obj.results,
-        obj.edges,
-        obj.mediaData?.threads,
-        obj.data?.mediaData?.threads,
-        obj.data?.threads,
-        obj.data?.posts,
-        obj.data?.items,
-        obj.data?.edges,
-        obj.data?.user?.threads
-    ];
-
-    for (const candidate of directCandidates) {
-        if (Array.isArray(candidate) && candidate.length > 0) {
-            return candidate;
-        }
-    }
-
-    for (const key of Object.keys(obj)) {
-        const found = findThreadsPosts(obj[key], depth + 1);
-        if (found.length > 0) return found;
-    }
-
-    return [];
-}
-
-async function resolveThreadsUserId(cleanUser, headers) {
-    if (/^\d+$/.test(cleanUser)) {
-        return cleanUser;
-    }
-
-    const cachedId = threadsUserIdCache.get(cleanUser);
-    if (cachedId) return cachedId;
-
-    const escapedUser = cleanUser.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-    // 1. Tenta primeiro o HTML público do Threads (custo 0 na RapidAPI)
-    const publicUrls = [
-        `https://www.threads.net/@${encodeURIComponent(cleanUser)}`,
-        `https://www.threads.com/@${encodeURIComponent(cleanUser)}`
-    ];
-
-    for (const pageUrl of publicUrls) {
-        try {
-            const pageRes = await axios.get(pageUrl, {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.9'
-                },
-                timeout: 12000
-            });
-            const html = String(pageRes.data || '');
-
-            const match = html.match(/"user_id"\s*:\s*"(\d+)"/)
-                || html.match(/"props"\s*:\s*\{"user_id"\s*:\s*"(\d+)"/)
-                || html.match(new RegExp(`"pk"\\s*:\\s*"(\\d+)"[\\s\\S]{0,300}?"username"\\s*:\\s*"${escapedUser}"`, 'i'))
-                || html.match(new RegExp(`"username"\\s*:\\s*"${escapedUser}"[\\s\\S]{0,300}?"pk"\\s*:\\s*"(\\d+)"`, 'i'))
-                || html.match(/threads:\/\/user\?id=(\d+)/i);
-
-            if (match && match[1]) {
-                threadsUserIdCache.set(cleanUser, match[1]);
-                return match[1];
-            }
-        } catch (e) {
-            // segue para a busca da API
-        }
-    }
-
-    // 2. Busca pelo endpoint Search da threads21
-    const modesToTry = ['profiles', 'users', 'top'];
-    for (const mode of modesToTry) {
-        try {
-            const res = await axios.get(`https://${THREADS_RAPIDAPI_HOST}/api/search`, {
-                params: { q: cleanUser, mode: mode, first: 10 },
-                headers,
-                timeout: 15000
-            });
-            const rawStr = JSON.stringify(res.data || {});
-
-            const userRegex = new RegExp(`"username"\\s*:\\s*"${escapedUser}"[\\s\\S]{0,1200}?"(?:pk|id|user_id)"\\s*:\\s*"?(\\d+)"?`, 'i');
-            const reverseRegex = new RegExp(`"(?:pk|id|user_id)"\\s*:\\s*"?(\\d+)"?[\\s\\S]{0,1200}?"username"\\s*:\\s*"${escapedUser}"`, 'i');
-            const m = rawStr.match(userRegex) || rawStr.match(reverseRegex);
-
-            if (m && m[1]) {
-                threadsUserIdCache.set(cleanUser, m[1]);
-                return m[1];
-            }
-        } catch (e) {
-            // tenta próximo mode
-        }
-    }
-
-    return null;
-}
-
-app.get('/api/latest-threads', async (req, res) => {
-    const { username } = req.query;
-    if (!username) {
-        return res.status(400).json({ error: 'Username é obrigatório.' });
-    }
-
-    const cleanUser = username.trim().toLowerCase().replace(/^@/, '');
-    const cached = threadsCache.get(cleanUser);
-    if (cached && (Date.now() - cached.timestamp < SHORT_CACHE_TTL)) {
-        return res.json(cached.data);
-    }
-
-    const apiKey = process.env.RAPIDAPI_KEY;
-    if (!apiKey) {
-        return res.status(500).json({ error: 'Variável RAPIDAPI_KEY não configurada.' });
-    }
-
-    const headers = {
-        'x-rapidapi-key': apiKey,
-        'x-rapidapi-host': THREADS_RAPIDAPI_HOST
-    };
-
-    try {
-        const userId = await resolveThreadsUserId(cleanUser, headers);
-
-        const postEndpoints = [];
-        if (userId) {
-            postEndpoints.push(
-                { url: `https://${THREADS_RAPIDAPI_HOST}/api/users/${encodeURIComponent(userId)}/posts`, params: { first: 10 }, isSearch: false },
-                { url: `https://${THREADS_RAPIDAPI_HOST}/api/users/${encodeURIComponent(userId)}/media`, params: { first: 10 }, isSearch: false },
-                { url: `https://${THREADS_RAPIDAPI_HOST}/api/users/${encodeURIComponent(userId)}/reposts`, params: { first: 10 }, isSearch: false }
-            );
-        }
-        postEndpoints.push(
-            { url: `https://${THREADS_RAPIDAPI_HOST}/api/search`, params: { q: cleanUser, mode: 'recent', first: 20 }, isSearch: true },
-            { url: `https://${THREADS_RAPIDAPI_HOST}/api/search`, params: { q: cleanUser, mode: 'top', first: 20 }, isSearch: true }
-        );
-
-        let validPosts = [];
-        let lastDebugSample = '';
-
-        for (const ep of postEndpoints) {
-            try {
-                const response = await axios.get(ep.url, {
-                    params: ep.params,
-                    headers,
-                    timeout: 25000
-                });
-                lastDebugSample = JSON.stringify(response.data).slice(0, 400);
-                const found = findThreadsPosts(response.data);
-
-                if (Array.isArray(found) && found.length > 0) {
-                    const extracted = found.map((entry) => {
-                        const item = entry?.node || entry;
-                        return item?.thread_items?.[0]?.post || item?.post || item;
-                    }).filter(Boolean);
-
-                    const authoredPosts = ep.isSearch
-                        ? extracted.filter((p) => (p?.user?.username || '').toLowerCase() === cleanUser)
-                        : extracted;
-
-                    if (authoredPosts.length > 0) {
-                        validPosts = authoredPosts;
-                        break;
-                    }
-                }
-            } catch (e) {
-                lastDebugSample = e.message;
-            }
-        }
-
-        if (validPosts.length === 0) {
-            return res.status(404).json({
-                error: 'Nenhuma publicação encontrada no Threads.',
-                resolved_user_id: userId || null,
-                debug_sample: lastDebugSample
-            });
-        }
-
-        validPosts.sort((a, b) => (Number(b?.taken_at) || 0) - (Number(a?.taken_at) || 0));
-        const post = validPosts[0];
-
-        const captionText = typeof post?.caption === 'string'
-            ? post.caption
-            : (post?.caption?.text || post?.text || '');
-        const postCode = post?.code || post?.shortcode || post?.pk || post?.id;
-
-        let rawMedia = null;
-        if (Array.isArray(post?.carousel_media) && post.carousel_media.length > 0) {
-            rawMedia = post.carousel_media[0]?.image_versions2?.candidates?.[0]?.url
-                || post.carousel_media[0]?.display_url
-                || null;
-        } else if (post?.image_versions2?.candidates?.[0]?.url) {
-            rawMedia = post.image_versions2.candidates[0].url;
-        } else if (post?.display_url || post?.thumbnail_url || post?.image_url) {
-            rawMedia = post.display_url || post.thumbnail_url || post.image_url;
-        }
-
-        const hostUrl = `https://${req.get('host')}`;
-        const finalUsername = post?.user?.username || (/^\d+$/.test(cleanUser) ? 'threads' : cleanUser);
-
-        const resultData = {
-            username: finalUsername,
-            text: captionText || `Nova atualização de @${finalUsername} no Threads`,
-            media_url: rawMedia ? `${hostUrl}/api/image-proxy?url=${encodeURIComponent(rawMedia)}` : null,
-            permalink: postCode
-                ? `https://www.threads.net/@${finalUsername}/post/${postCode}`
-                : `https://www.threads.net/@${finalUsername}`
-        };
-
-        threadsCache.set(cleanUser, { timestamp: Date.now(), data: resultData });
-        return res.json(resultData);
-
-    } catch (error) {
-        console.error(`Erro Threads @${cleanUser}:`, error.response?.status, error.message);
-        return res.status(500).json({
-            error: 'Não foi possível carregar o último post do Threads.',
-            status_code: error.response?.status || 500,
-            details: error.response?.data || error.message
-        });
     }
 });
 

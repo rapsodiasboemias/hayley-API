@@ -19,18 +19,24 @@ const youtubeIdCache = new Map();
 const tiktokCache = new Map();
 const threadsCache = new Map();
 const CACHE_TTL = 12 * 60 * 60 * 1000;
+const IG_CACHE_TTL = 2 * 60 * 60 * 1000;
 
 // Limpeza automática de cache expirado a cada 6 horas
 setInterval(() => {
     const now = Date.now();
-    [postsCache, tweetsCache, youtubeCache, tiktokCache, threadsCache].forEach(cache => {
+    for (const [key, value] of postsCache.entries()) {
+        if (now - value.timestamp >= IG_CACHE_TTL) {
+            postsCache.delete(key);
+        }
+    }
+    [tweetsCache, youtubeCache, tiktokCache, threadsCache].forEach(cache => {
         for (const [key, value] of cache.entries()) {
             if (now - value.timestamp >= CACHE_TTL) {
                 cache.delete(key);
             }
         }
     });
-}, 6 * 60 * 60 * 1000);
+}, 60 * 60 * 1000);
 
 app.get('/', (req, res) => {
     res.json({
@@ -149,10 +155,10 @@ app.get('/api/latest-post', async (req, res) => {
     const cleanUser = username.trim().toLowerCase().replace(/^@/, '');
 
     const cachedPost = postsCache.get(cleanUser);
-    if (cachedPost && (Date.now() - cachedPost.timestamp < CACHE_TTL)) {
+    if (cachedPost && (Date.now() - cachedPost.timestamp < IG_CACHE_TTL)) {
         return res.json(cachedPost.data);
     }
-
+    
     const apiKey = process.env.RAPIDAPI_KEY;
     if (!apiKey) {
         return res.status(500).json({ error: 'Variável RAPIDAPI_KEY não configurada na Render.' });

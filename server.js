@@ -788,23 +788,47 @@ app.get('/api/latest-threads', async (req, res) => {
             });
         }
 
-        validPosts.sort((a, b) => (Number(b?.taken_at) || 0) - (Number(a?.taken_at) || 0));
+validPosts.sort((a, b) => (Number(b?.taken_at) || 0) - (Number(a?.taken_at) || 0));
         const post = validPosts[0];
         const firstEntry = post?._rawEntry || post;
 
-        const captionText = typeof post?.caption === 'string'
-            ? post.caption
-            : (post?.caption?.text || post?.text || '');
-        const postCode = post?.code || post?.shortcode || post?.pk || post?.id;
-
-        let rawMedia = null;
+        // Reúne o post principal e todas as bolhas da thread (thread_items)
         const candidatePosts = [post];
         if (Array.isArray(firstEntry?.thread_items)) {
             for (const ti of firstEntry.thread_items) {
-                if (ti?.post) candidatePosts.push(ti.post);
+                if (ti?.post && ti.post !== post) candidatePosts.push(ti.post);
             }
         }
 
+        // 1. Extrai o texto de qualquer bolha ou fragmento do post
+        let captionText = '';
+        for (const p of candidatePosts) {
+            if (!p) continue;
+            if (typeof p.caption === 'string' && p.caption.trim()) {
+                captionText = p.caption.trim();
+            } else if (p.caption?.text && p.caption.text.trim()) {
+                captionText = p.caption.text.trim();
+            } else if (typeof p.text === 'string' && p.text.trim()) {
+                captionText = p.text.trim();
+            } else if (Array.isArray(p.text_post_app_info?.text_fragments?.fragments)) {
+                const joined = p.text_post_app_info.text_fragments.fragments
+                    .map(f => f?.plaintext || f?.text || '')
+                    .join('')
+                    .trim();
+                if (joined) captionText = joined;
+            }
+            if (captionText) break;
+        }
+
+        // 2. Extrai o código do post para o permalink
+        let postCode = null;
+        for (const p of candidatePosts) {
+            postCode = p?.code || p?.shortcode || p?.pk || p?.id;
+            if (postCode) break;
+        }
+
+        // 3. Extrai a imagem de qualquer bolha, carrossel ou preview
+        let rawMedia = null;
         for (const p of candidatePosts) {
             if (!p) continue;
             if (Array.isArray(p.carousel_media) && p.carousel_media.length > 0) {
@@ -827,6 +851,18 @@ app.get('/api/latest-threads', async (req, res) => {
             }
             if (rawMedia) break;
         }
+
+        const hostUrl = `https://${req.get('host')}`;
+        const finalUsername = post?.user?.username || (/^\d+$/.test(cleanUser) ? 'threads' : cleanUser);
+
+        const resultData = {
+            username: finalUsername,
+            text: captionText || (rawMedia ? '' : `See post by @${finalUsername} on Threads`),
+            media_url: rawMedia ? `${hostUrl}/api/image-proxy?url=${encodeURIComponent(rawMedia)}` : null,
+            permalink: postCode
+                ? `https://www.threads.net/@${finalUsername}/post/${postCode}`
+                : `https://www.threads.net/@${finalUsername}`
+        };
 
         const hostUrl = `https://${req.get('host')}`;
         const finalUsername = post?.user?.username || (/^\d+$/.test(cleanUser) ? 'threads' : cleanUser);

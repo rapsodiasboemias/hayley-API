@@ -60,15 +60,144 @@ app.get('/', (req, res) => {
 // ==========================================
 
 function encodeAo3Tag(tag) {
-    return encodeURIComponent(
-        tag.trim()
-            .replace(/\//g, '*s*')
-            .replace(/&/g, '*a*')
-            .replace(/\./g, '*d*')
-            .replace(/#/g, '*h*')
-            .replace(/\?/g, '*q*')
-    );
+    let normalized = tag.trim();
+    try {
+        normalized = decodeURIComponent(normalized);
+    } catch (e) {}
+
+    // Se já veio no formato AO3 (*s*, *a*, etc.), volta para os caracteres originais antes de re-codificar
+    normalized = normalized
+        .replace(/\*s\*/g, '/')
+        .replace(/\*a\*/g, '&')
+        .replace(/\*d\*/g, '.')
+        .replace(/\*h\*/g, '#')
+        .replace(/\*q\*/g, '?');
+
+    const ao3Formatted = normalized
+        .replace(/\//g, '*s*')
+        .replace(/&/g, '*a*')
+        .replace(/\./g, '*d*')
+        .replace(/#/g, '*h*')
+        .replace(/\?/g, '*q*');
+
+    // encodeURIComponent não codifica '*', então *s* permanece intacto!
+    return encodeURIComponent(ao3Formatted);
 }
+
+app.get('/api/latest-ao3', async (req, res) => {
+    const rawTag = (req.query.tag || '').trim();
+    if (!rawTag) {
+        return res.status(400).json({ error: 'Parâmetro tag é obrigatório.' });
+    }
+
+    const cacheKey = rawTag.toLowerCase();
+    const cached = ao3Cache.get(cacheKey);
+    if (cached && (Date.now() - cached.timestamp < AO3_CACHE_TTL)) {
+        return res.json(cached.data);
+    }
+
+    const encodedTag = encodeAo3Tag(rawTag);
+    const targetUrl = `https://archiveofourown.org/tags/${encodedTag}/works?view_adult=true`;
+
+    const ao3Headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cookie': 'view_adult=true'
+    };
+
+    try {
+        const response = await axios.get(targetUrl, {
+            headers: ao3Headers,
+            timeout: 20000,
+            maxRedirects: 5
+        });
+
+        const html = String(response.data || '');
+        const $ = cheerio.load(html);
+
+        // 1. Tenta extrair direto da listagem HTML
+        const firstWork = $('ol.work.index.group > li.work.blurb').first();
+        if (firstWork.length) {
+            const titleEl = firstWork.find('.header h4.heading a').first();
+            const title = titleEl.text().trim();
+            const href = titleEl.attr('href') || '';
+            const url = href.startsWith('http') ? href : `https://archiveofourown.org${href}`;
+
+            const authors = [];
+            firstWork.find('.header a[rel="author"]').each((_, el) => {
+                authors.push($(el).text().trim());
+            });
+            const author = authors.length > 0 ? authors.join(', ') : 'Anonymous';
+
+            const rating = firstWork.find('.required-tags .rating').text().trim();
+            const words = firstWork.find('dl.stats dd.words').text().trim();
+            const chapters = firstWork.find('dl.stats dd.chapters').text().trim();
+            const summary = firstWork.find('blockquote.summary').text().replace(/\s+/g, ' ').trim();
+
+            const payload = { tag: rawTag, title, url, author, rating, words, chapters, summary };
+            ao3Cache.set(cacheKey, { timestamp: Date.now(), data: payload });
+            return res.json(payload);
+        }
+
+        // 2. Fallback: se a página redirecionou para a tag principal que contém o link do feed Atom (/tags/ID/feed.atom)
+        const feedHref = $('a.rss').attr('href');
+        if (feedHref) {
+            const feedUrl = feedHref.startsWith('http') ? feedHref : `https://archiveofourown.org${feedHref}`;
+            const feedRes = await axios.get(feedUrl, {
+                headers: {
+                    'User-Agent': ao3Headers['User-Agent'],
+                    'Accept': 'application/atom+xml,application/xml,text/xml'
+                },
+                timeout: 15000
+            });
+
+            const xml = String(feedRes.data || '');
+            const entryMatch = xml.match(/<entry>([\s\S]*?)<\/entry>/);
+            if (entryMatch) {
+                const entry = entryMatch[1];
+                const titleMatch = entry.match(/<title>([\s\S]*?)<\/title>/);
+                const linkMatch = entry.match(/<link[^>]+href="([^"]+)"/);
+                const authorMatch = entry.match(/<author>\s*<name>([\s\S]*?)<\/name>/);
+                const summaryMatch = entry.match(/<summary[^>]*>([\s\S]*?)<\/summary>/);
+
+                const rawSummaryHtml = decodeXmlEntities(summaryMatch ? summaryMatch[1] : '');
+                const $sum = cheerio.load(rawSummaryHtml);
+                const cleanSummary = $sum('blockquote').text().replace(/\s+/g, ' ').trim()
+                    || $sum.text().replace(/\s+/g, ' ').trim();
+
+                const payload = {
+                    tag: rawTag,
+                    title: titleMatch ? decodeXmlEntities(titleMatch[1].trim()) : 'Untitled Work',
+                    url: linkMatch ? linkMatch[1].trim() : targetUrl,
+                    author: authorMatch ? decodeXmlEntities(authorMatch[1].trim()) : 'Anonymous',
+                    rating: '',
+                    words: '',
+                    chapters: '',
+                    summary: cleanSummary
+                };
+
+                ao3Cache.set(cacheKey, { timestamp: Date.now(), data: payload });
+                return res.json(payload);
+            }
+        }
+
+        return res.status(404).json({
+            error: 'Nenhuma obra encontrada para esta tag no AO3.',
+            tested_url: targetUrl
+        });
+
+    } catch (error) {
+        const status = error.response?.status || 502;
+        console.error(`Erro ao buscar AO3 (${rawTag}):`, status, error.message);
+        return res.status(status).json({
+            error: 'Não foi possível carregar a obra do AO3.',
+            status_code: status,
+            tested_url: targetUrl,
+            details: error.message
+        });
+    }
+});
 
 function extractInstagramImageUrl(item) {
     if (!item) return null;

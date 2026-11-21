@@ -87,113 +87,87 @@ function encodeAo3Tag(tag) {
 app.get('/api/latest-ao3', async (req, res) => {
     const rawTag = (req.query.tag || '').trim();
     if (!rawTag) {
-        return res.status(400).json({ error: 'Parâmetro tag é obrigatório.' });
+        return res.status(400).json({ error: 'Parâmetro tag (ID numérico ou URL do feed) é obrigatório.' });
     }
 
-    const cacheKey = rawTag.toLowerCase();
-    const cached = ao3Cache.get(cacheKey);
+    // Extrai o ID numérico caso o usuário cole a URL inteira (ex: .../tags/271715/feed.atom) ou só o número (271715)
+    const idMatch = rawTag.match(/(\d+)/);
+    if (!idMatch) {
+        return res.status(400).json({ error: 'Informe o ID numérico da tag do AO3 (ex: 271715).' });
+    }
+
+    const tagId = idMatch[1];
+    const cached = ao3Cache.get(tagId);
     if (cached && (Date.now() - cached.timestamp < AO3_CACHE_TTL)) {
         return res.json(cached.data);
     }
 
-    const encodedTag = encodeAo3Tag(rawTag);
-    const targetUrl = `https://archiveofourown.org/tags/${encodedTag}/works?view_adult=true`;
-
-    const ao3Headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Cookie': 'view_adult=true'
-    };
+    const feedUrl = `https://archiveofourown.org/tags/${tagId}/feed.atom`;
 
     try {
-        const response = await axios.get(targetUrl, {
-            headers: ao3Headers,
-            timeout: 20000,
-            maxRedirects: 5
+        const response = await axios.get(feedUrl, {
+            headers: {
+                'User-Agent': 'TumblrThemeAO3Widget/1.0 (https://hayley-api.onrender.com)',
+                'Accept': 'application/atom+xml,application/xml,text/xml,*/*;q=0.8'
+            },
+            timeout: 15000
         });
 
-        const html = String(response.data || '');
-        const $ = cheerio.load(html);
+        const xml = String(response.data || '');
+        const $ = cheerio.load(xml, { xmlMode: true });
 
-        // 1. Tenta extrair direto da listagem HTML
-        const firstWork = $('ol.work.index.group > li.work.blurb').first();
-        if (firstWork.length) {
-            const titleEl = firstWork.find('.header h4.heading a').first();
-            const title = titleEl.text().trim();
-            const href = titleEl.attr('href') || '';
-            const url = href.startsWith('http') ? href : `https://archiveofourown.org${href}`;
+        const feedTitle = $('feed > title').first().text().replace(/^AO3 works tagged\s*/i, '').replace(/^['"]|['"]$/g, '').trim();
+        const firstEntry = $('entry').first();
 
-            const authors = [];
-            firstWork.find('.header a[rel="author"]').each((_, el) => {
-                authors.push($(el).text().trim());
-            });
-            const author = authors.length > 0 ? authors.join(', ') : 'Anonymous';
-
-            const rating = firstWork.find('.required-tags .rating').text().trim();
-            const words = firstWork.find('dl.stats dd.words').text().trim();
-            const chapters = firstWork.find('dl.stats dd.chapters').text().trim();
-            const summary = firstWork.find('blockquote.summary').text().replace(/\s+/g, ' ').trim();
-
-            const payload = { tag: rawTag, title, url, author, rating, words, chapters, summary };
-            ao3Cache.set(cacheKey, { timestamp: Date.now(), data: payload });
-            return res.json(payload);
+        if (!firstEntry.length) {
+            return res.status(404).json({ error: 'Nenhuma obra encontrada neste feed do AO3.' });
         }
 
-        // 2. Fallback: se a página redirecionou para a tag principal que contém o link do feed Atom (/tags/ID/feed.atom)
-        const feedHref = $('a.rss').attr('href');
-        if (feedHref) {
-            const feedUrl = feedHref.startsWith('http') ? feedHref : `https://archiveofourown.org${feedHref}`;
-            const feedRes = await axios.get(feedUrl, {
-                headers: {
-                    'User-Agent': ao3Headers['User-Agent'],
-                    'Accept': 'application/atom+xml,application/xml,text/xml'
-                },
-                timeout: 15000
-            });
+        const title = firstEntry.find('title').first().text().trim() || 'Untitled Work';
+        const url = firstEntry.find('link[rel="alternate"]').attr('href')
+            || firstEntry.find('link').first().attr('href')
+            || `https://archiveofourown.org/tags/${tagId}/works`;
 
-            const xml = String(feedRes.data || '');
-            const entryMatch = xml.match(/<entry>([\s\S]*?)<\/entry>/);
-            if (entryMatch) {
-                const entry = entryMatch[1];
-                const titleMatch = entry.match(/<title>([\s\S]*?)<\/title>/);
-                const linkMatch = entry.match(/<link[^>]+href="([^"]+)"/);
-                const authorMatch = entry.match(/<author>\s*<name>([\s\S]*?)<\/name>/);
-                const summaryMatch = entry.match(/<summary[^>]*>([\s\S]*?)<\/summary>/);
-
-                const rawSummaryHtml = decodeXmlEntities(summaryMatch ? summaryMatch[1] : '');
-                const $sum = cheerio.load(rawSummaryHtml);
-                const cleanSummary = $sum('blockquote').text().replace(/\s+/g, ' ').trim()
-                    || $sum.text().replace(/\s+/g, ' ').trim();
-
-                const payload = {
-                    tag: rawTag,
-                    title: titleMatch ? decodeXmlEntities(titleMatch[1].trim()) : 'Untitled Work',
-                    url: linkMatch ? linkMatch[1].trim() : targetUrl,
-                    author: authorMatch ? decodeXmlEntities(authorMatch[1].trim()) : 'Anonymous',
-                    rating: '',
-                    words: '',
-                    chapters: '',
-                    summary: cleanSummary
-                };
-
-                ao3Cache.set(cacheKey, { timestamp: Date.now(), data: payload });
-                return res.json(payload);
-            }
-        }
-
-        return res.status(404).json({
-            error: 'Nenhuma obra encontrada para esta tag no AO3.',
-            tested_url: targetUrl
+        const authors = [];
+        firstEntry.find('author > name').each((_, el) => {
+            authors.push($(el).text().trim());
         });
+        const author = authors.length > 0 ? authors.join(', ') : 'Anonymous';
+
+        // O <summary> do feed Atom do AO3 traz um HTML com o resumo e os metadados (Words, Chapters, Rating)
+        const summaryHtml = firstEntry.find('summary').first().text();
+        const $sum = cheerio.load(summaryHtml);
+
+        const cleanSummary = $sum('blockquote').first().text().replace(/\s+/g, ' ').trim();
+        const fullText = $sum.text();
+
+        const wordsMatch = fullText.match(/Words:\s*([\d,]+)/i);
+        const chaptersMatch = fullText.match(/Chapters:\s*([\d\/?]+)/i);
+        const ratingMatch = fullText.match(/Rating:\s*([^\n•|]+)/i);
+
+        const payload = {
+            tag_id: tagId,
+            tag_name: feedTitle || `Tag #${tagId}`,
+            tag_url: `https://archiveofourown.org/tags/${tagId}/works`,
+            title,
+            url,
+            author,
+            rating: ratingMatch ? ratingMatch[1].trim() : '',
+            words: wordsMatch ? wordsMatch[1].trim() : '',
+            chapters: chaptersMatch ? chaptersMatch[1].trim() : '',
+            summary: cleanSummary
+        };
+
+        ao3Cache.set(tagId, { timestamp: Date.now(), data: payload });
+        return res.json(payload);
 
     } catch (error) {
         const status = error.response?.status || 502;
-        console.error(`Erro ao buscar AO3 (${rawTag}):`, status, error.message);
+        console.error(`Erro ao buscar feed AO3 (${tagId}):`, status, error.message);
         return res.status(status).json({
-            error: 'Não foi possível carregar a obra do AO3.',
+            error: 'Não foi possível carregar o feed do AO3.',
             status_code: status,
-            tested_url: targetUrl,
+            tested_url: feedUrl,
             details: error.message
         });
     }

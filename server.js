@@ -47,6 +47,104 @@ app.get('/', (req, res) => {
     });
 });
 
+const express = require('express');
+const cheerio = require('cheerio');
+const app = express();
+
+// Cache em memória (TTL de 2 horas)
+const ao3Cache = new Map();
+const AO3_CACHE_TTL = 2 * 60 * 60 * 1000;
+
+function encodeAo3Tag(tag) {
+    return encodeURIComponent(
+        tag.trim()
+            .replace(/\//g, '*s*')
+            .replace(/&/g, '*a*')
+            .replace(/\./g, '*d*')
+            .replace(/#/g, '*h*')
+            .replace(/\?/g, '*q*')
+    );
+}
+
+app.get('/api/latest-ao3', async (req, res) => {
+    // Libera CORS para qualquer blog do Tumblr que usar o seu tema
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    const rawTag = (req.query.tag || '').trim();
+    if (!rawTag) {
+        return res.status(400).json({ error: 'Missing tag parameter' });
+    }
+
+    const cacheKey = rawTag.toLowerCase();
+    const cached = ao3Cache.get(cacheKey);
+    if (cached && (Date.now() - cached.ts < AO3_CACHE_TTL)) {
+        return res.json(cached.data);
+    }
+
+    try {
+        const encodedTag = encodeAo3Tag(rawTag);
+        const targetUrl = `https://archiveofourown.org/tags/${encodedTag}/works?view_adult=true`;
+
+        const response = await fetch(targetUrl, {
+            headers: {
+                // O AO3 exige um User-Agent identificável para não bloquear com erro 429/525
+                'User-Agent': 'TumblrThemeAO3Widget/1.0 (https://hayley-api.onrender.com)',
+                'Accept': 'text/html,application/xhtml+xml'
+            }
+        });
+
+        if (!response.ok) {
+            throw new Error(`AO3 responded with HTTP ${response.status}`);
+        }
+
+        const html = await response.text();
+        const $ = cheerio.load(html);
+
+        const firstWork = $('ol.work.index.group > li.work.blurb').first();
+        if (!firstWork.length) {
+            return res.status(404).json({ error: 'No works found for this tag' });
+        }
+
+        const titleEl = firstWork.find('.header h4.heading a').first();
+        const title = titleEl.text().trim();
+        const href = titleEl.attr('href') || '';
+        const url = href.startsWith('http') ? href : `https://archiveofourown.org${href}`;
+
+        const authors = [];
+        firstWork.find('.header a[rel="author"]').each((_, el) => {
+            authors.push($(el).text().trim());
+        });
+        const author = authors.length > 0 ? authors.join(', ') : 'Anonymous';
+
+        const rating = firstWork.find('.required-tags .rating').text().trim();
+        const words = firstWork.find('dl.stats dd.words').text().trim();
+        const chapters = firstWork.find('dl.stats dd.chapters').text().trim();
+
+        const summary = firstWork
+            .find('blockquote.summary')
+            .text()
+            .replace(/\s+/g, ' ')
+            .trim();
+
+        const payload = {
+            tag: rawTag,
+            title,
+            url,
+            author,
+            rating,
+            words,
+            chapters,
+            summary
+        };
+
+        ao3Cache.set(cacheKey, { ts: Date.now(), data: payload });
+        return res.json(payload);
+
+    } catch (err) {
+        return res.status(502).json({ error: err.message });
+    }
+});
+
 // ==========================================
 // FUNÇÕES AUXILIARES
 // ==========================================

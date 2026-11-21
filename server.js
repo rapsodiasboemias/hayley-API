@@ -1,6 +1,7 @@
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
+const cheerio = require('cheerio');
 
 const app = express();
 app.use(cors());
@@ -18,9 +19,11 @@ const youtubeIdCache = new Map();
 const tiktokCache = new Map();
 const threadsCache = new Map();
 const threadsUserIdCache = new Map();
+const ao3Cache = new Map();
 
 const CACHE_TTL = 12 * 60 * 60 * 1000;       // 12h para YouTube e Twitter/X
 const SHORT_CACHE_TTL = 4 * 60 * 60 * 1000;  // 4h para Instagram, Threads e TikTok
+const AO3_CACHE_TTL = 2 * 60 * 60 * 1000;    // 2h para AO3
 
 setInterval(() => {
     const now = Date.now();
@@ -38,22 +41,23 @@ setInterval(() => {
             }
         }
     });
+    for (const [key, value] of ao3Cache.entries()) {
+        if (now - value.timestamp >= AO3_CACHE_TTL) {
+            ao3Cache.delete(key);
+        }
+    }
 }, 60 * 60 * 1000);
 
 app.get('/', (req, res) => {
     res.json({
         status: 'online',
-        message: 'API Proxy Source Blogs Ready (IG, X, YT, TikTok, Threads) ativa'
+        message: 'API Proxy Source Blogs Ready (IG, X, YT, TikTok, Threads, AO3) ativa'
     });
 });
 
-const express = require('express');
-const cheerio = require('cheerio');
-const app = express();
-
-// Cache em memória (TTL de 2 horas)
-const ao3Cache = new Map();
-const AO3_CACHE_TTL = 2 * 60 * 60 * 1000;
+// ==========================================
+// FUNÇÕES AUXILIARES
+// ==========================================
 
 function encodeAo3Tag(tag) {
     return encodeURIComponent(
@@ -65,89 +69,6 @@ function encodeAo3Tag(tag) {
             .replace(/\?/g, '*q*')
     );
 }
-
-app.get('/api/latest-ao3', async (req, res) => {
-    // Libera CORS para qualquer blog do Tumblr que usar o seu tema
-    res.setHeader('Access-Control-Allow-Origin', '*');
-
-    const rawTag = (req.query.tag || '').trim();
-    if (!rawTag) {
-        return res.status(400).json({ error: 'Missing tag parameter' });
-    }
-
-    const cacheKey = rawTag.toLowerCase();
-    const cached = ao3Cache.get(cacheKey);
-    if (cached && (Date.now() - cached.ts < AO3_CACHE_TTL)) {
-        return res.json(cached.data);
-    }
-
-    try {
-        const encodedTag = encodeAo3Tag(rawTag);
-        const targetUrl = `https://archiveofourown.org/tags/${encodedTag}/works?view_adult=true`;
-
-        const response = await fetch(targetUrl, {
-            headers: {
-                // O AO3 exige um User-Agent identificável para não bloquear com erro 429/525
-                'User-Agent': 'TumblrThemeAO3Widget/1.0 (https://hayley-api.onrender.com)',
-                'Accept': 'text/html,application/xhtml+xml'
-            }
-        });
-
-        if (!response.ok) {
-            throw new Error(`AO3 responded with HTTP ${response.status}`);
-        }
-
-        const html = await response.text();
-        const $ = cheerio.load(html);
-
-        const firstWork = $('ol.work.index.group > li.work.blurb').first();
-        if (!firstWork.length) {
-            return res.status(404).json({ error: 'No works found for this tag' });
-        }
-
-        const titleEl = firstWork.find('.header h4.heading a').first();
-        const title = titleEl.text().trim();
-        const href = titleEl.attr('href') || '';
-        const url = href.startsWith('http') ? href : `https://archiveofourown.org${href}`;
-
-        const authors = [];
-        firstWork.find('.header a[rel="author"]').each((_, el) => {
-            authors.push($(el).text().trim());
-        });
-        const author = authors.length > 0 ? authors.join(', ') : 'Anonymous';
-
-        const rating = firstWork.find('.required-tags .rating').text().trim();
-        const words = firstWork.find('dl.stats dd.words').text().trim();
-        const chapters = firstWork.find('dl.stats dd.chapters').text().trim();
-
-        const summary = firstWork
-            .find('blockquote.summary')
-            .text()
-            .replace(/\s+/g, ' ')
-            .trim();
-
-        const payload = {
-            tag: rawTag,
-            title,
-            url,
-            author,
-            rating,
-            words,
-            chapters,
-            summary
-        };
-
-        ao3Cache.set(cacheKey, { ts: Date.now(), data: payload });
-        return res.json(payload);
-
-    } catch (err) {
-        return res.status(502).json({ error: err.message });
-    }
-});
-
-// ==========================================
-// FUNÇÕES AUXILIARES
-// ==========================================
 
 function extractInstagramImageUrl(item) {
     if (!item) return null;
@@ -216,6 +137,83 @@ function decodeXmlEntities(str) {
         .replace(/&quot;/g, '"')
         .replace(/&#39;/g, "'");
 }
+
+// ==========================================
+// ROTA ARCHIVE OF OUR OWN (/api/latest-ao3)
+// ==========================================
+
+app.get('/api/latest-ao3', async (req, res) => {
+    const rawTag = (req.query.tag || '').trim();
+    if (!rawTag) {
+        return res.status(400).json({ error: 'Parâmetro tag é obrigatório.' });
+    }
+
+    const cacheKey = rawTag.toLowerCase();
+    const cached = ao3Cache.get(cacheKey);
+    if (cached && (Date.now() - cached.timestamp < AO3_CACHE_TTL)) {
+        return res.json(cached.data);
+    }
+
+    try {
+        const encodedTag = encodeAo3Tag(rawTag);
+        const targetUrl = `https://archiveofourown.org/tags/${encodedTag}/works?view_adult=true`;
+
+        const response = await axios.get(targetUrl, {
+            headers: {
+                'User-Agent': 'TumblrThemeAO3Widget/1.0 (https://hayley-api.onrender.com)',
+                'Accept': 'text/html,application/xhtml+xml'
+            },
+            timeout: 15000
+        });
+
+        const $ = cheerio.load(String(response.data || ''));
+        const firstWork = $('ol.work.index.group > li.work.blurb').first();
+
+        if (!firstWork.length) {
+            return res.status(404).json({ error: 'Nenhuma obra encontrada para esta tag no AO3.' });
+        }
+
+        const titleEl = firstWork.find('.header h4.heading a').first();
+        const title = titleEl.text().trim();
+        const href = titleEl.attr('href') || '';
+        const url = href.startsWith('http') ? href : `https://archiveofourown.org${href}`;
+
+        const authors = [];
+        firstWork.find('.header a[rel="author"]').each((_, el) => {
+            authors.push($(el).text().trim());
+        });
+        const author = authors.length > 0 ? authors.join(', ') : 'Anonymous';
+
+        const rating = firstWork.find('.required-tags .rating').text().trim();
+        const words = firstWork.find('dl.stats dd.words').text().trim();
+        const chapters = firstWork.find('dl.stats dd.chapters').text().trim();
+
+        const summary = firstWork
+            .find('blockquote.summary')
+            .text()
+            .replace(/\s+/g, ' ')
+            .trim();
+
+        const payload = {
+            tag: rawTag,
+            title,
+            url,
+            author,
+            rating,
+            words,
+            chapters,
+            summary
+        };
+
+        ao3Cache.set(cacheKey, { timestamp: Date.now(), data: payload });
+        return res.json(payload);
+
+    } catch (error) {
+        const status = error.response?.status || 502;
+        console.error(`Erro ao buscar AO3 (${rawTag}):`, status, error.message);
+        return res.status(status).json({ error: 'Não foi possível carregar a obra do AO3.' });
+    }
+});
 
 // ==========================================
 // ROTA INSTAGRAM (/api/latest-post)
@@ -841,7 +839,6 @@ app.get('/api/latest-threads', async (req, res) => {
         const post = validPosts[0];
         const firstEntry = post?._rawEntry || post;
 
-        // Reúne o post principal e todas as bolhas da thread (thread_items)
         const candidatePosts = [post];
         if (Array.isArray(firstEntry?.thread_items)) {
             for (const ti of firstEntry.thread_items) {
@@ -849,7 +846,6 @@ app.get('/api/latest-threads', async (req, res) => {
             }
         }
 
-        // 1. Extrai o texto de qualquer bolha ou fragmento do post
         let captionText = '';
         for (const p of candidatePosts) {
             if (!p) continue;
@@ -869,14 +865,12 @@ app.get('/api/latest-threads', async (req, res) => {
             if (captionText) break;
         }
 
-        // 2. Extrai o código do post para o permalink
         let postCode = null;
         for (const p of candidatePosts) {
             postCode = p?.code || p?.shortcode || p?.pk || p?.id;
             if (postCode) break;
         }
 
-        // 3. Extrai a imagem de qualquer bolha, carrossel ou preview
         let rawMedia = null;
         for (const p of candidatePosts) {
             if (!p) continue;

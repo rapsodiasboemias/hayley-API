@@ -84,13 +84,14 @@ function encodeAo3Tag(tag) {
     return encodeURIComponent(ao3Formatted);
 }
 
+const ao3StaleCache = new Map(); // Guarda a última resposta válida indefinidamente como plano B
+
 app.get('/api/latest-ao3', async (req, res) => {
     const rawTag = (req.query.tag || '').trim();
     if (!rawTag) {
         return res.status(400).json({ error: 'Parâmetro tag (ID numérico ou URL do feed) é obrigatório.' });
     }
 
-    // Extrai o ID numérico caso o usuário cole a URL inteira (ex: .../tags/271715/feed.atom) ou só o número (271715)
     const idMatch = rawTag.match(/(\d+)/);
     if (!idMatch) {
         return res.status(400).json({ error: 'Informe o ID numérico da tag do AO3 (ex: 271715).' });
@@ -104,10 +105,28 @@ app.get('/api/latest-ao3', async (req, res) => {
 
     const feedUrl = `https://archiveofourown.org/tags/${tagId}/feed.atom`;
 
+    // Função auxiliar para extrair dados do HTML interno do <summary> do AO3
+    function parseAo3SummaryHtml(summaryHtml) {
+        const $sum = cheerio.load(summaryHtml || '');
+        const cleanSummary = $sum('blockquote').first().text().replace(/\s+/g, ' ').trim();
+        const fullText = $sum.text();
+        const wordsMatch = fullText.match(/Words:\s*([\d,]+)/i);
+        const chaptersMatch = fullText.match(/Chapters:\s*([\d\/?]+)/i);
+        const ratingMatch = fullText.match(/Rating:\s*([^\n•|]+)/i);
+
+        return {
+            rating: ratingMatch ? ratingMatch[1].trim() : '',
+            words: wordsMatch ? wordsMatch[1].trim() : '',
+            chapters: chaptersMatch ? chaptersMatch[1].trim() : '',
+            summary: cleanSummary
+        };
+    }
+
+    // 1. Tentativa direta no Feed Atom do AO3
     try {
         const response = await axios.get(feedUrl, {
             headers: {
-                'User-Agent': 'TumblrThemeAO3Widget/1.0 (https://hayley-api.onrender.com)',
+                'User-Agent': 'TumblrThemeAO3Widget/1.0 (+https://hayley-api.onrender.com)',
                 'Accept': 'application/atom+xml,application/xml,text/xml,*/*;q=0.8'
             },
             timeout: 15000
@@ -116,61 +135,93 @@ app.get('/api/latest-ao3', async (req, res) => {
         const xml = String(response.data || '');
         const $ = cheerio.load(xml, { xmlMode: true });
 
-        const feedTitle = $('feed > title').first().text().replace(/^AO3 works tagged\s*/i, '').replace(/^['"]|['"]$/g, '').trim();
+        const feedTitle = $('feed > title').first().text()
+            .replace(/^AO3 works tagged\s*/i, '')
+            .replace(/^['"]|['"]$/g, '')
+            .trim();
+
         const firstEntry = $('entry').first();
+        if (firstEntry.length) {
+            const title = firstEntry.find('title').first().text().trim() || 'Untitled Work';
+            const url = firstEntry.find('link[rel="alternate"]').attr('href')
+                || firstEntry.find('link').first().attr('href')
+                || `https://archiveofourown.org/tags/${tagId}/works`;
 
-        if (!firstEntry.length) {
-            return res.status(404).json({ error: 'Nenhuma obra encontrada neste feed do AO3.' });
+            const authors = [];
+            firstEntry.find('author > name').each((_, el) => {
+                authors.push($(el).text().trim());
+            });
+
+            const meta = parseAo3SummaryHtml(firstEntry.find('summary').first().text());
+
+            const payload = {
+                tag_id: tagId,
+                tag_name: feedTitle || `Tag #${tagId}`,
+                tag_url: `https://archiveofourown.org/tags/${tagId}/works`,
+                title,
+                url,
+                author: authors.length > 0 ? authors.join(', ') : 'Anonymous',
+                rating: meta.rating,
+                words: meta.words,
+                chapters: meta.chapters,
+                summary: meta.summary
+            };
+
+            ao3Cache.set(tagId, { timestamp: Date.now(), data: payload });
+            ao3StaleCache.set(tagId, payload);
+            return res.json(payload);
         }
-
-        const title = firstEntry.find('title').first().text().trim() || 'Untitled Work';
-        const url = firstEntry.find('link[rel="alternate"]').attr('href')
-            || firstEntry.find('link').first().attr('href')
-            || `https://archiveofourown.org/tags/${tagId}/works`;
-
-        const authors = [];
-        firstEntry.find('author > name').each((_, el) => {
-            authors.push($(el).text().trim());
-        });
-        const author = authors.length > 0 ? authors.join(', ') : 'Anonymous';
-
-        // O <summary> do feed Atom do AO3 traz um HTML com o resumo e os metadados (Words, Chapters, Rating)
-        const summaryHtml = firstEntry.find('summary').first().text();
-        const $sum = cheerio.load(summaryHtml);
-
-        const cleanSummary = $sum('blockquote').first().text().replace(/\s+/g, ' ').trim();
-        const fullText = $sum.text();
-
-        const wordsMatch = fullText.match(/Words:\s*([\d,]+)/i);
-        const chaptersMatch = fullText.match(/Chapters:\s*([\d\/?]+)/i);
-        const ratingMatch = fullText.match(/Rating:\s*([^\n•|]+)/i);
-
-        const payload = {
-            tag_id: tagId,
-            tag_name: feedTitle || `Tag #${tagId}`,
-            tag_url: `https://archiveofourown.org/tags/${tagId}/works`,
-            title,
-            url,
-            author,
-            rating: ratingMatch ? ratingMatch[1].trim() : '',
-            words: wordsMatch ? wordsMatch[1].trim() : '',
-            chapters: chaptersMatch ? chaptersMatch[1].trim() : '',
-            summary: cleanSummary
-        };
-
-        ao3Cache.set(tagId, { timestamp: Date.now(), data: payload });
-        return res.json(payload);
-
-    } catch (error) {
-        const status = error.response?.status || 502;
-        console.error(`Erro ao buscar feed AO3 (${tagId}):`, status, error.message);
-        return res.status(status).json({
-            error: 'Não foi possível carregar o feed do AO3.',
-            status_code: status,
-            tested_url: feedUrl,
-            details: error.message
-        });
+    } catch (directErr) {
+        console.warn(`AO3 direto (${tagId}) falhou (${directErr.response?.status || directErr.message}), tentando fallback...`);
     }
+
+    // 2. Fallback automático via rss2json (caso o IP do Render tome 429 do AO3)
+    try {
+        const rss2jsonUrl = `https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(feedUrl)}`;
+        const fallbackRes = await axios.get(rss2jsonUrl, { timeout: 15000 });
+
+        if (fallbackRes.data?.status === 'ok' && Array.isArray(fallbackRes.data.items) && fallbackRes.data.items.length > 0) {
+            const item = fallbackRes.data.items[0];
+            const feedTitle = (fallbackRes.data.feed?.title || '')
+                .replace(/^AO3 works tagged\s*/i, '')
+                .replace(/^['"]|['"]$/g, '')
+                .trim();
+
+            const meta = parseAo3SummaryHtml(item.description || item.content || '');
+
+            const payload = {
+                tag_id: tagId,
+                tag_name: feedTitle || `Tag #${tagId}`,
+                tag_url: `https://archiveofourown.org/tags/${tagId}/works`,
+                title: (item.title || 'Untitled Work').trim(),
+                url: item.link || `https://archiveofourown.org/tags/${tagId}/works`,
+                author: (item.author || 'Anonymous').trim(),
+                rating: meta.rating,
+                words: meta.words,
+                chapters: meta.chapters,
+                summary: meta.summary
+            };
+
+            ao3Cache.set(tagId, { timestamp: Date.now(), data: payload });
+            ao3StaleCache.set(tagId, payload);
+            return res.json(payload);
+        }
+    } catch (fallbackErr) {
+        console.warn(`Fallback rss2json (${tagId}) também falhou:`, fallbackErr.message);
+    }
+
+    // 3. Se ambos falharem (ex: pico de 429), entrega o último resultado válido salvo
+    if (ao3StaleCache.has(tagId)) {
+        const staleData = ao3StaleCache.get(tagId);
+        // Espera 30 min antes de tentar renovar novamente
+        ao3Cache.set(tagId, { timestamp: Date.now() - (AO3_CACHE_TTL - 30 * 60 * 1000), data: staleData });
+        return res.json(staleData);
+    }
+
+    return res.status(429).json({
+        error: 'AO3 temporariamente ocupado (rate limit). Tente novamente em alguns minutos.',
+        tested_url: feedUrl
+    });
 });
 
 function extractInstagramImageUrl(item) {
